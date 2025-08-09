@@ -134,9 +134,8 @@ void CodeGenerator::visit(FuncDefNode& node) {
         }
         else {
             // 超过8个的参数通过栈传递
-            // 在RISC-V中，栈传递的参数位于调用者的栈帧中
-            // 当被调用函数执行时，这些参数位于sp + total_space的位置
             const int caller_offset = total_space + (static_cast<int>(i) - 8) * 4;
+            //const int caller_offset = current_offset + local_space + temp_space + frame_space + (static_cast<int>(i) - 8) * 4;
             // 对于通过栈传递的参数，需要特别处理大偏移量
             if (caller_offset >= 2048) {
                 // 为栈传递的参数分配局部空间
