@@ -162,11 +162,18 @@ void CodeGenerator::visit(FuncDefNode& node) {
     stack_offset = param_space;  // 局部变量起始偏移
     temp_area_start = stack_offset + local_space;  // 临时区起始偏移
 
-    // 关键修复：正确计算出参区基址
-    // 出参区在栈帧的最高地址处（紧邻调用者栈帧）
-   // current_out_arg_base = frame_size - frame_space - outgoing_space;
+    // 关键修复：临时区结束位置应该在出参区之前，留有足够空间
+    // 不要让temp_area_end等于current_out_arg_base
+    temp_area_end = temp_area_start + temp_space;  // 临时区结束位置
+
+    // 出参区基址（在栈帧的最高地址处）
     current_out_arg_base = frame_size;
-    temp_area_end = current_out_arg_base;  // 临时区结束（不超过出参区）
+
+    // 确保临时区不会和出参区重叠
+    if (temp_area_end > frame_size - outgoing_space - frame_space) {
+        // 如果临时区太大，调整它
+        temp_area_end = frame_size - outgoing_space - frame_space - 8; // 留8字节安全边界
+    }
 
     // 7. 生成函数体
     node.block->accept(*this);
@@ -717,27 +724,30 @@ void CodeGenerator::visit(FuncCallExprNode& node) {
     // 保存当前使用的临时寄存器
     std::vector<std::string> saved_regs;
     std::vector<int> save_offsets;
+
+    // 修复：确保保存寄存器时使用正确的偏移
+    int save_base = temp_area_start;  // 使用临时区起始位置
+    int save_offset_counter = 0;
+
     for (int i = 0; i < RegisterAllocator::NUM_TEMP_REGS; ++i) {
         std::string temp_reg = "t" + std::to_string(i);
         if (reg_alloc.isUsed(temp_reg)) {
-            int offset = getTempStackOffset();
+            // 使用固定的保存位置，避免getTempStackOffset()的问题
+            int offset = save_base + save_offset_counter * 4;
+            save_offset_counter++;
+
             if (offset >= -2048 && offset < 2048) {
                 out << "    sw " << temp_reg << ", " << offset << "(sp)\n";
             } else {
-                out << "    addi sp, sp, -8\n";
-                out << "    sw t5, 0(sp)\n";
-                out << "    li t5, " << offset << "\n";
-                out << "    add t5, sp, t5\n";
-                out << "    addi t5, t5, 8\n";
-                out << "    sw " << temp_reg << ", 0(t5)\n";
-                out << "    lw t5, 0(sp)\n";
-                out << "    addi sp, sp, 8\n";
+                std::string addr_reg = "t6";  // 使用固定的临时寄存器
+                out << "    li " << addr_reg << ", " << offset << "\n";
+                out << "    add " << addr_reg << ", sp, " << addr_reg << "\n";
+                out << "    sw " << temp_reg << ", 0(" << addr_reg << ")\n";
             }
             saved_regs.push_back(temp_reg);
             save_offsets.push_back(offset);
         }
     }
-
     // 传递参数（使用寄存器a0-a7和预留出参区）
     for (int i = 0; i < n; ++i) {
         std::string arg_reg = generateExpr(node.args[i]);
@@ -768,14 +778,10 @@ void CodeGenerator::visit(FuncCallExprNode& node) {
         if (offset >= -2048 && offset < 2048) {
             out << "    lw " << saved_regs[i] << ", " << offset << "(sp)\n";
         } else {
-            out << "    addi sp, sp, -8\n";
-            out << "    sw t5, 0(sp)\n";
-            out << "    li t5, " << offset << "\n";
-            out << "    add t5, sp, t5\n";
-            out << "    addi t5, t5, 8\n";
-            out << "    lw " << saved_regs[i] << ", 0(t5)\n";
-            out << "    lw t5, 0(sp)\n";
-            out << "    addi sp, sp, 8\n";
+            std::string addr_reg = "t6";  // 使用固定的临时寄存器
+            out << "    li " << addr_reg << ", " << offset << "\n";
+            out << "    add " << addr_reg << ", sp, " << addr_reg << "\n";
+            out << "    lw " << saved_regs[i] << ", 0(" << addr_reg << ")\n";
         }
     }
 
@@ -947,13 +953,16 @@ int CodeGenerator::calculateTempSpaceNeed(const std::shared_ptr<BlockNode>& bloc
     int function_call_space = max_function_call_args * 4 + 7 * 4; // 7个临时寄存器溢出
     int expression_space = max_expression_depth * 8; // 每层8字节
 
-    // 关键修改：确保有足够的参数准备空间
-    // main函数调用sum64时需要准备56个参数，很多是复杂表达式
-    // 从你的汇编看，需要至少 908-688=220 字节的额外空间
+    // 确保有足够的参数准备空间和寄存器保存空间
     temp_space = std::max(temp_space, function_call_space + expression_space + max_arg_prep_space);
 
-    // 为main函数提供更多额外空间
-    temp_space += 400; // 增加到400字节的额外缓冲区
+    // 增加更多的缓冲空间，避免溢出
+    temp_space += 512;  // 增加到512字节的额外缓冲区
+
+    // 对于有很多函数调用的函数，需要更多空间
+    if (max_function_call_args > 16) {
+        temp_space += (max_function_call_args - 16) * 8;  // 每个额外参数8字节
+    }
 
     return temp_space;
 }
