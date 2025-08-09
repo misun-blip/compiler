@@ -722,11 +722,13 @@ void CodeGenerator::visit(ParamNode& node) {
 void CodeGenerator::visit(FuncCallExprNode& node) {
     const int n = static_cast<int>(node.args.size());
 
-    // 1. 收集并保存当前使用的寄存器
+    // 1. 收集当前正被使用的临时寄存器
     std::vector<std::string> saved_regs;
     std::vector<int> save_offsets;
-    int save_base = temp_area_start;
+
+    int save_base = temp_area_start; // 从临时区起始位置开始保存
     int save_off  = 0;
+
     for (int i = 0; i < RegisterAllocator::NUM_TEMP_REGS; ++i) {
         std::string treg = "t" + std::to_string(i);
         if (reg_alloc.isUsed(treg)) {
@@ -736,65 +738,76 @@ void CodeGenerator::visit(FuncCallExprNode& node) {
         }
     }
 
-    // 保存这些寄存器
+    // 2. 保存寄存器
     for (size_t i = 0; i < saved_regs.size(); ++i) {
         int off = save_offsets[i];
         if (off >= -2048 && off < 2048) {
             out << "    sw " << saved_regs[i] << ", " << off << "(sp)\n";
         } else {
-            // 使用一个安全的寄存器（例如 a5），它会被调用覆盖
-            out << "    li a5, " << off << "\n";
-            out << "    add a5, sp, a5\n";
-            out << "    sw " << saved_regs[i] << ", 0(a5)\n";
+            // 临时申请一个安全寄存器来计算地址
+            std::string tmp = allocateRegister();
+            out << "    li " << tmp << ", " << off << "\n";
+            out << "    add " << tmp << ", sp, " << tmp << "\n";
+            out << "    sw " << saved_regs[i] << ", 0(" << tmp << ")\n";
+            freeRegister(tmp);
         }
     }
 
-    // 释放标记，允许参数计算复用
-    for (auto &r : saved_regs) reg_alloc.free(r);
+    // 3. 释放已保存寄存器，供参数计算分配使用
+    for (const auto& r : saved_regs) {
+        reg_alloc.free(r);
+    }
 
-    // 2. 先计算所有参数，保存到arg_regs
+    // 4. 计算所有参数
     std::vector<std::string> arg_regs;
+    arg_regs.reserve(n);
     for (int i = 0; i < n; ++i) {
         arg_regs.push_back(generateExpr(node.args[i]));
     }
 
-    // 3. 传递参数
+    // 5. 传递参数
     for (int i = 0; i < n; ++i) {
         if (i < 8) {
             if (arg_regs[i] != "a" + std::to_string(i)) {
                 out << "    mv a" << i << ", " << arg_regs[i] << "\n";
             }
         } else {
-            const int off = current_out_arg_base + (i - 8) * 4;
+            int off = current_out_arg_base + (i - 8) * 4;
             if (off >= -2048 && off < 2048) {
                 out << "    sw " << arg_regs[i] << ", " << off << "(sp)\n";
             } else {
-                out << "    li a5, " << off << "\n";
-                out << "    add a5, sp, a5\n";
-                out << "    sw " << arg_regs[i] << ", 0(a5)\n";
+                std::string tmp = allocateRegister();
+                out << "    li " << tmp << ", " << off << "\n";
+                out << "    add " << tmp << ", sp, " << tmp << "\n";
+                out << "    sw " << arg_regs[i] << ", 0(" << tmp << ")\n";
+                freeRegister(tmp);
             }
         }
     }
 
-    // 释放参数寄存器
-    for (auto &r : arg_regs) freeRegister(r);
+    // 6. 释放参数寄存器
+    for (const auto& r : arg_regs) {
+        freeRegister(r);
+    }
 
-    // 4. 发起调用
+    // 7. 调用函数
     out << "    jal ra, " << node.funcName << "\n";
 
-    // 5. 恢复保存的寄存器（反向顺序）
+    // 8. 恢复保存的寄存器
     for (int i = static_cast<int>(saved_regs.size()) - 1; i >= 0; --i) {
         int off = save_offsets[i];
         if (off >= -2048 && off < 2048) {
             out << "    lw " << saved_regs[i] << ", " << off << "(sp)\n";
         } else {
-            out << "    li a5, " << off << "\n";
-            out << "    add a5, sp, a5\n";
-            out << "    lw " << saved_regs[i] << ", 0(a5)\n";
+            std::string tmp = allocateRegister();
+            out << "    li " << tmp << ", " << off << "\n";
+            out << "    add " << tmp << ", sp, " << tmp << "\n";
+            out << "    lw " << saved_regs[i] << ", 0(" << tmp << ")\n";
+            freeRegister(tmp);
         }
     }
 
-    // 6. 返回值传到新寄存器
+    // 9. 返回值寄存器 a0 -> 给当前表达式分配一个寄存器保存
     current_expr_result = allocateRegister();
     out << "    mv " << current_expr_result << ", a0\n";
 }
