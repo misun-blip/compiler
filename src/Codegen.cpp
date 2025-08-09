@@ -134,8 +134,8 @@ void CodeGenerator::visit(FuncDefNode& node) {
         }
         else {
             // 超过8个的参数通过栈传递
-            const int caller_offset = total_space + (static_cast<int>(i) - 8) * 4;
-            //const int caller_offset = current_offset + local_space + temp_space + frame_space + (static_cast<int>(i) - 8) * 4;
+            // 栈参数在函数栈帧内部，偏移量应该是相对于当前sp的位置
+            const int caller_offset = (static_cast<int>(i) - 8) * 4;
             // 对于通过栈传递的参数，需要特别处理大偏移量
             if (caller_offset >= 2048) {
                 // 为栈传递的参数分配局部空间
@@ -811,12 +811,12 @@ void CodeGenerator::visit(FuncCallExprNode& node) {
         std::string temp = "t0";  // 使用固定的临时寄存器
 
         if (offset >= -2048 && offset < 2048) {
-            out << "    lw " << temp << ", " << offset + 4 << "(sp)\n";  // +4因为我们刚调整了sp
+            out << "    lw " << temp << ", " << offset << "(sp)\n";  // 不需要+4，因为sp已经调整了
         }
         else {
             out << "    addi sp, sp, -8\n";
             out << "    sw t5, 0(sp)\n";
-            out << "    li t5, " << (offset + 12) << "\n";  // +12 = +4 (sp调整) + 8 (临时保存t5)
+            out << "    li t5, " << (offset + 8) << "\n";  // +8 = 临时保存t5的空间
             out << "    add t5, sp, t5\n";
             out << "    lw " << temp << ", 0(t5)\n";
             out << "    lw t5, 0(sp)\n";
