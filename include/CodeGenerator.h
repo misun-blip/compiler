@@ -181,6 +181,7 @@ public:
 
     // ASTVisitor接口实现
     void visit(CompUnitNode& node) override;
+    int computeMaxCallArgs(const std::shared_ptr<BlockNode>& block) const;
     void visit(FuncDefNode& node) override;
     void visit(BlockNode& node) override;
     void visit(StmtNode& node) override;
@@ -230,7 +231,7 @@ private:
     std::vector<std::string> continue_labels;   // 用于continue语句的标签
     std::string current_expr_result;             // 当前表达式的结果寄存器
     bool in_continue_statement;                 // 是否在continue语句中
-
+    int current_out_arg_base = 0;  // 当前函数的出参区基址（相对sp的偏移）
     // 溢出栈，记录需要恢复的寄存器和偏移
     std::stack<std::pair<std::string, int>> spill_stack;
 
