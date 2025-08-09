@@ -33,40 +33,81 @@ void CodeGenerator::visit(CompUnitNode& node) {
 // 新增：计算函数体中最大调用实参个数
 int CodeGenerator::computeMaxCallArgs(const std::shared_ptr<BlockNode>& block) const {
     int max_args = 0;
-    std::function<void(const std::shared_ptr<StmtNode>&)> walk = [&](const std::shared_ptr<StmtNode>& stmt) {
+
+    std::function<void(const std::shared_ptr<ExprNode>&)> walkExpr =
+        [&](const std::shared_ptr<ExprNode>& expr) {
+        if (!expr) return;
+
+        if (const auto func_call = std::dynamic_pointer_cast<FuncCallExprNode>(expr)) {
+            max_args = std::max(max_args, (int)func_call->args.size());
+            // 递归处理参数中的函数调用
+            for (const auto& arg : func_call->args) {
+                walkExpr(arg);
+            }
+        }
+        else if (const auto add = std::dynamic_pointer_cast<AddExprNode>(expr)) {
+            walkExpr(add->left);
+            walkExpr(add->right);
+        }
+        else if (const auto mul = std::dynamic_pointer_cast<MulExprNode>(expr)) {
+            walkExpr(mul->left);
+            walkExpr(mul->right);
+        }
+        else if (const auto rel = std::dynamic_pointer_cast<RelExprNode>(expr)) {
+            walkExpr(rel->left);
+            walkExpr(rel->right);
+        }
+        else if (const auto land = std::dynamic_pointer_cast<LAndExprNode>(expr)) {
+            walkExpr(land->left);
+            walkExpr(land->right);
+        }
+        else if (const auto lor = std::dynamic_pointer_cast<LOrExprNode>(expr)) {
+            walkExpr(lor->left);
+            walkExpr(lor->right);
+        }
+        else if (const auto unary = std::dynamic_pointer_cast<UnaryExprNode>(expr)) {
+            walkExpr(unary->expr);
+        }
+    };
+
+    std::function<void(const std::shared_ptr<StmtNode>&)> walk =
+        [&](const std::shared_ptr<StmtNode>& stmt) {
         if (!stmt) return;
 
-        // 处理函数调用语句
         if (const auto call_stmt = std::dynamic_pointer_cast<CallStmtNode>(stmt)) {
             if (const auto func_call = std::dynamic_pointer_cast<FuncCallExprNode>(call_stmt->call)) {
                 max_args = std::max(max_args, (int)func_call->args.size());
-            }
-        }
-        // 处理表达式语句中的函数调用
-        else if (const auto expr_stmt = std::dynamic_pointer_cast<ExprStmtNode>(stmt)) {
-            if (const auto func_call = std::dynamic_pointer_cast<FuncCallExprNode>(expr_stmt->expr)) {
-                max_args = std::max(max_args, (int)func_call->args.size());
-            }
-        }
-        // 处理return语句中的函数调用
-        else if (const auto return_stmt = std::dynamic_pointer_cast<ReturnStmtNode>(stmt)) {
-            if (return_stmt->retExpr) {
-                if (const auto func_call = std::dynamic_pointer_cast<FuncCallExprNode>(return_stmt->retExpr)) {
-                    max_args = std::max(max_args, (int)func_call->args.size());
+                for (const auto& arg : func_call->args) {
+                    walkExpr(arg);
                 }
             }
         }
-        // 递归处理块语句
+        else if (const auto expr_stmt = std::dynamic_pointer_cast<ExprStmtNode>(stmt)) {
+            walkExpr(expr_stmt->expr);
+        }
+        else if (const auto assign_stmt = std::dynamic_pointer_cast<AssignStmtNode>(stmt)) {
+            walkExpr(assign_stmt->expr);
+        }
+        else if (const auto decl_stmt = std::dynamic_pointer_cast<DeclStmtNode>(stmt)) {
+            if (decl_stmt->initExpr) {
+                walkExpr(decl_stmt->initExpr);
+            }
+        }
+        else if (const auto return_stmt = std::dynamic_pointer_cast<ReturnStmtNode>(stmt)) {
+            if (return_stmt->retExpr) {
+                walkExpr(return_stmt->retExpr);
+            }
+        }
         else if (const auto block_stmt = std::dynamic_pointer_cast<BlockNode>(stmt)) {
             for (const auto& s : block_stmt->stmts) walk(s);
         }
-        // 处理if语句
         else if (const auto if_stmt = std::dynamic_pointer_cast<IfStmtNode>(stmt)) {
+            walkExpr(if_stmt->cond);
             walk(if_stmt->thenStmt);
             walk(if_stmt->elseStmt);
         }
-        // 处理while语句
         else if (const auto while_stmt = std::dynamic_pointer_cast<WhileStmtNode>(stmt)) {
+            walkExpr(while_stmt->cond);
             walk(while_stmt->body);
         }
     };
@@ -76,7 +117,6 @@ int CodeGenerator::computeMaxCallArgs(const std::shared_ptr<BlockNode>& block) c
     }
     return max_args;
 }
-
 void CodeGenerator::visit(FuncDefNode& node) {
     current_function = node.id;
     stack_offset = 0;
@@ -189,37 +229,34 @@ void CodeGenerator::visit(FuncDefNode& node) {
 // 计算局部变量的空间需求
 int CodeGenerator::calculateLocalSpace(const std::shared_ptr<BlockNode>& block) {
     int space = 0;
-    std::set<std::string> declared_vars;    // 记录声明过的变量
 
     std::function<void(const std::shared_ptr<BlockNode>&)> calculateSpace =
         [&](const std::shared_ptr<BlockNode>& current_block) {
-        for (const auto& stmt : current_block->stmts) {
-            if (const auto decl = std::dynamic_pointer_cast<DeclStmtNode>(stmt)) {
-                if (declared_vars.find(decl->id) == declared_vars.end()) {  // 变量没有声明过
-                    space += 4;                                             // 变量占用4字节
-                    declared_vars.insert(decl->id);                         // 记录声明
+            for (const auto& stmt : current_block->stmts) {
+                if (const auto decl = std::dynamic_pointer_cast<DeclStmtNode>(stmt)) {
+                    // 每个声明都需要空间，即使变量名相同（在不同作用域）
+                    space += 4;
                 }
-            }
-            else if (const auto if_stmt = std::dynamic_pointer_cast<IfStmtNode>(stmt)) {
-                if (auto then_block = std::dynamic_pointer_cast<BlockNode>(if_stmt->thenStmt)) {
-                    calculateSpace(then_block);
-                }
-                if (if_stmt->elseStmt) {
-                    if (auto else_block = std::dynamic_pointer_cast<BlockNode>(if_stmt->elseStmt)) {
-                        calculateSpace(else_block);
+                else if (const auto if_stmt = std::dynamic_pointer_cast<IfStmtNode>(stmt)) {
+                    if (auto then_block = std::dynamic_pointer_cast<BlockNode>(if_stmt->thenStmt)) {
+                        calculateSpace(then_block);
+                    }
+                    if (if_stmt->elseStmt) {
+                        if (auto else_block = std::dynamic_pointer_cast<BlockNode>(if_stmt->elseStmt)) {
+                            calculateSpace(else_block);
+                        }
                     }
                 }
-            }
-            else if (const auto while_stmt = std::dynamic_pointer_cast<WhileStmtNode>(stmt)) {
-                if (auto body_block = std::dynamic_pointer_cast<BlockNode>(while_stmt->body)) {
-                    calculateSpace(body_block);
+                else if (const auto while_stmt = std::dynamic_pointer_cast<WhileStmtNode>(stmt)) {
+                    if (auto body_block = std::dynamic_pointer_cast<BlockNode>(while_stmt->body)) {
+                        calculateSpace(body_block);
+                    }
+                }
+                else if (auto block_stmt = std::dynamic_pointer_cast<BlockNode>(stmt)) {
+                    calculateSpace(block_stmt);
                 }
             }
-            else if (auto block_stmt = std::dynamic_pointer_cast<BlockNode>(stmt)) {
-                calculateSpace(block_stmt);
-            }
-        }
-        };
+    };
 
     calculateSpace(block);
     return space;
@@ -857,18 +894,21 @@ void CodeGenerator::generateCondOr(const std::shared_ptr<LOrExprNode>& node, con
 
 // 计算临时空间需求
 int CodeGenerator::calculateTempSpaceNeed(const std::shared_ptr<BlockNode>& block) {
-    int temp_space = 256; // 默认值
+    int temp_space = 256;
     int max_function_call_args = 0;
     int max_expression_depth = 0;
     int max_arg_prep_space = 0;
+    int max_nested_calls = 0;  // 新增：嵌套调用深度
 
     std::function<void(const std::shared_ptr<BlockNode>&)> analyzeBlock;
-    std::function<int(const std::shared_ptr<ExprNode>&)> analyzeExpr;
+    std::function<int(const std::shared_ptr<ExprNode>&, int)> analyzeExpr;
 
-    analyzeExpr = [&](const std::shared_ptr<ExprNode>& expr) -> int {
+    analyzeExpr = [&](const std::shared_ptr<ExprNode>& expr, int call_depth) -> int {
         if (!expr) return 0;
+
         if (const auto funcCall = std::dynamic_pointer_cast<FuncCallExprNode>(expr)) {
             max_function_call_args = std::max(max_function_call_args, static_cast<int>(funcCall->args.size()));
+            max_nested_calls = std::max(max_nested_calls, call_depth + 1);
 
             int arg_prep_count = 0;
             for (const auto& arg : funcCall->args) {
@@ -882,28 +922,27 @@ int CodeGenerator::calculateTempSpaceNeed(const std::shared_ptr<BlockNode>& bloc
 
             int depth = 1;
             for (const auto& arg : funcCall->args) {
-                depth = std::max(depth, 1 + analyzeExpr(arg));
+                depth = std::max(depth, 1 + analyzeExpr(arg, call_depth + 1));
             }
             return depth;
         }
-        // 针对 AddExprNode, MulExprNode, RelExprNode, LAndExprNode, LOrExprNode 分别处理
         else if (const auto add = std::dynamic_pointer_cast<AddExprNode>(expr)) {
-            return 1 + std::max(analyzeExpr(add->left), analyzeExpr(add->right));
+            return 1 + std::max(analyzeExpr(add->left, call_depth), analyzeExpr(add->right, call_depth));
         }
         else if (const auto mul = std::dynamic_pointer_cast<MulExprNode>(expr)) {
-            return 1 + std::max(analyzeExpr(mul->left), analyzeExpr(mul->right));
+            return 1 + std::max(analyzeExpr(mul->left, call_depth), analyzeExpr(mul->right, call_depth));
         }
         else if (const auto rel = std::dynamic_pointer_cast<RelExprNode>(expr)) {
-            return 1 + std::max(analyzeExpr(rel->left), analyzeExpr(rel->right));
+            return 1 + std::max(analyzeExpr(rel->left, call_depth), analyzeExpr(rel->right, call_depth));
         }
         else if (const auto lor = std::dynamic_pointer_cast<LOrExprNode>(expr)) {
-            return 1 + std::max(analyzeExpr(lor->left), analyzeExpr(lor->right));
+            return 1 + std::max(analyzeExpr(lor->left, call_depth), analyzeExpr(lor->right, call_depth));
         }
         else if (const auto land = std::dynamic_pointer_cast<LAndExprNode>(expr)) {
-            return 1 + std::max(analyzeExpr(land->left), analyzeExpr(land->right));
+            return 1 + std::max(analyzeExpr(land->left, call_depth), analyzeExpr(land->right, call_depth));
         }
         else if (const auto unary = std::dynamic_pointer_cast<UnaryExprNode>(expr)) {
-            return 1 + analyzeExpr(unary->expr);
+            return 1 + analyzeExpr(unary->expr, call_depth);
         }
         return 1;
     };
@@ -911,18 +950,18 @@ int CodeGenerator::calculateTempSpaceNeed(const std::shared_ptr<BlockNode>& bloc
     analyzeBlock = [&](const std::shared_ptr<BlockNode>& blk) {
         for (const auto& stmt : blk->stmts) {
             if (const auto exprStmt = std::dynamic_pointer_cast<ExprStmtNode>(stmt)) {
-                max_expression_depth = std::max(max_expression_depth, analyzeExpr(exprStmt->expr));
+                max_expression_depth = std::max(max_expression_depth, analyzeExpr(exprStmt->expr, 0));
             }
             else if (const auto assignStmt = std::dynamic_pointer_cast<AssignStmtNode>(stmt)) {
-                max_expression_depth = std::max(max_expression_depth, analyzeExpr(assignStmt->expr));
+                max_expression_depth = std::max(max_expression_depth, analyzeExpr(assignStmt->expr, 0));
             }
             else if (const auto declStmt = std::dynamic_pointer_cast<DeclStmtNode>(stmt)) {
                 if (declStmt->initExpr) {
-                    max_expression_depth = std::max(max_expression_depth, analyzeExpr(declStmt->initExpr));
+                    max_expression_depth = std::max(max_expression_depth, analyzeExpr(declStmt->initExpr, 0));
                 }
             }
             else if (const auto ifStmt = std::dynamic_pointer_cast<IfStmtNode>(stmt)) {
-                max_expression_depth = std::max(max_expression_depth, analyzeExpr(ifStmt->cond));
+                max_expression_depth = std::max(max_expression_depth, analyzeExpr(ifStmt->cond, 0));
                 if (auto thenBlock = std::dynamic_pointer_cast<BlockNode>(ifStmt->thenStmt))
                     analyzeBlock(thenBlock);
                 if (ifStmt->elseStmt) {
@@ -931,13 +970,13 @@ int CodeGenerator::calculateTempSpaceNeed(const std::shared_ptr<BlockNode>& bloc
                 }
             }
             else if (const auto whileStmt = std::dynamic_pointer_cast<WhileStmtNode>(stmt)) {
-                max_expression_depth = std::max(max_expression_depth, analyzeExpr(whileStmt->cond));
+                max_expression_depth = std::max(max_expression_depth, analyzeExpr(whileStmt->cond, 0));
                 if (auto bodyBlock = std::dynamic_pointer_cast<BlockNode>(whileStmt->body))
                     analyzeBlock(bodyBlock);
             }
             else if (const auto returnStmt = std::dynamic_pointer_cast<ReturnStmtNode>(stmt)) {
                 if (returnStmt->retExpr) {
-                    max_expression_depth = std::max(max_expression_depth, analyzeExpr(returnStmt->retExpr));
+                    max_expression_depth = std::max(max_expression_depth, analyzeExpr(returnStmt->retExpr, 0));
                 }
             }
             else if (const auto callStmt = std::dynamic_pointer_cast<CallStmtNode>(stmt)) {
@@ -950,7 +989,7 @@ int CodeGenerator::calculateTempSpaceNeed(const std::shared_ptr<BlockNode>& bloc
                             std::dynamic_pointer_cast<FuncCallExprNode>(arg)) {
                             arg_prep_count++;
                         }
-                        max_expression_depth = std::max(max_expression_depth, analyzeExpr(arg));
+                        max_expression_depth = std::max(max_expression_depth, analyzeExpr(arg, 0));
                     }
                     max_arg_prep_space = std::max(max_arg_prep_space, arg_prep_count * 4);
                 }
@@ -963,14 +1002,26 @@ int CodeGenerator::calculateTempSpaceNeed(const std::shared_ptr<BlockNode>& bloc
 
     analyzeBlock(block);
 
-    int function_call_space = max_function_call_args * 4 + RegisterAllocator::NUM_TEMP_REGS * 4;
-    int expression_space    = max_expression_depth * 8;
+    // 基础空间计算
+    int function_call_space = max_function_call_args * 8;  // 增加每个参数的空间
+    int expression_space = max_expression_depth * 16;      // 增加表达式栈空间
+    int nested_call_space = max_nested_calls * 64;         // 嵌套调用额外空间
 
-    // 在返回前，确保有足够的空间
-    temp_space = std::max(temp_space, 1024); // 最小1KB
+    temp_space = std::max(temp_space, function_call_space + expression_space + max_arg_prep_space + nested_call_space);
 
-    // 为寄存器保存预留空间（每个寄存器4字节，最多7个，加安全边界）
-    temp_space += RegisterAllocator::NUM_TEMP_REGS * 4 + 32;
+    // 增加基础缓冲区
+    temp_space += 1024;  // 从512增加到1024
+
+    // 大参数函数额外空间
+    if (max_function_call_args > 8) {
+        temp_space += (max_function_call_args - 8) * 16;  // 增加栈参数空间
+    }
+
+    // 寄存器保存区
+    temp_space += RegisterAllocator::NUM_TEMP_REGS * 4 + 64;  // 增加安全边界
+
+    // 确保最小空间
+    temp_space = std::max(temp_space, 2048);  // 最小2KB
 
     // 对齐到16B
     if (temp_space % 16 != 0) {
