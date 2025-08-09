@@ -10,20 +10,19 @@
 #include "SemanticAnalyzer.h"
 
 int main() {
-    // 移除 chcp 命令，因为它只在Windows上可用
     try {
-
-         /*std::string inputFilename = "../test/19_many_arguments.tc";
-         std::ifstream File(inputFilename);
-         if (!File.is_open()) {
-             std::cerr << "error: file " << inputFilename << " not found or not accessible" << std::endl;
-             return 1;
-         }
-         std::string inputCode;
-         std::string line;
-         while (std::getline(File, line)) {
-             inputCode += line + '\n';
-         }*/
+        // 从文件读取源代码
+        // std::string inputFilename = "../test/19_many_arguments.tc";
+        // std::ifstream File(inputFilename);
+        // if (!File.is_open()) {
+        //     std::cerr << "error: file " << inputFilename << " not found or not accessible" << std::endl;
+        //     return 1;
+        // }
+        // std::string inputCode;
+        // std::string line;
+        // while (std::getline(File, line)) {
+        //     inputCode += line + '\n';
+        // }
 
         // 从标准输入读取源代码
         std::string inputCode;
@@ -64,14 +63,13 @@ int main() {
 
      //  std::cout<<"语义分析完成"<<std::endl;
 
-        /*//代码生成并输出到标准输出（已重定向到文件）
-        CodeGenerator codegen(std::cout);*/
-         // 修改输出文件路径为当前目录，确保在评测系统中能正常工作
-         std::ofstream output("compilation_result.txt");
-         if (!output.is_open()) {
-             throw std::runtime_error("无法打开输出文件");
-         }
-        CodeGenerator codegen(output);
+        //代码生成并输出到标准输出（已重定向到文件）
+        CodeGenerator codegen(std::cout);
+        //  std::ofstream output("../result/compilation_result.txt");
+        //  if (!output.is_open()) {
+        //      throw std::runtime_error("无法打开输出文件");
+        //  }
+        // CodeGenerator codegen(output);
         codegen.generate(compUnit);
 
     } catch (const SemanticError& e) {
