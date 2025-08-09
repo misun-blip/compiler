@@ -36,6 +36,19 @@ public:
         return ""; // 没有可用寄存器
     }
 
+    // 强制标记寄存器为已使用
+    void markUsed(const std::string& reg) {
+        if (reg.length() >= 2 && reg[0] == 't') {
+            try {
+                const int reg_num = std::stoi(reg.substr(1));
+                if (reg_num >= 0 && reg_num < NUM_TEMP_REGS) {
+                    reg_in_use[reg_num] = true;
+                }
+            }
+            catch (...) {}
+        }
+    }
+
     // 强制分配寄存器，如果需要会选择一个寄存器溢出
     std::pair<std::string, int> forceAllocate(std::ostream& out, const int temp_offset) {
         std::string reg = tryAllocate();

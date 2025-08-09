@@ -721,71 +721,78 @@ void CodeGenerator::visit(ParamNode& node) {
 void CodeGenerator::visit(FuncCallExprNode& node) {
     const int n = static_cast<int>(node.args.size());
 
-    // 保存当前使用的临时寄存器
+    /* 1. 收集并保存当前已占用的临时寄存器 */
     std::vector<std::string> saved_regs;
     std::vector<int> save_offsets;
-
-    // 修复：确保保存寄存器时使用正确的偏移
-    int save_base = temp_area_start;  // 使用临时区起始位置
-    int save_offset_counter = 0;
+    int save_base = temp_area_start;
+    int save_off  = 0;
 
     for (int i = 0; i < RegisterAllocator::NUM_TEMP_REGS; ++i) {
-        std::string temp_reg = "t" + std::to_string(i);
-        if (reg_alloc.isUsed(temp_reg)) {
-            // 使用固定的保存位置，避免getTempStackOffset()的问题
-            int offset = save_base + save_offset_counter * 4;
-            save_offset_counter++;
-
-            if (offset >= -2048 && offset < 2048) {
-                out << "    sw " << temp_reg << ", " << offset << "(sp)\n";
-            } else {
-                std::string addr_reg = "t6";  // 使用固定的临时寄存器
-                out << "    li " << addr_reg << ", " << offset << "\n";
-                out << "    add " << addr_reg << ", sp, " << addr_reg << "\n";
-                out << "    sw " << temp_reg << ", 0(" << addr_reg << ")\n";
-            }
-            saved_regs.push_back(temp_reg);
-            save_offsets.push_back(offset);
+        std::string t = "t" + std::to_string(i);
+        if (reg_alloc.isUsed(t)) {
+            saved_regs.push_back(t);
+            save_offsets.push_back(save_base + save_off);
+            save_off += 4;
         }
     }
-    // 传递参数（使用寄存器a0-a7和预留出参区）
-    for (int i = 0; i < n; ++i) {
-        std::string arg_reg = generateExpr(node.args[i]);
-        if (i < 8) {
-            out << "    mv a" << i << ", " << arg_reg << "\n";
+
+    /* 2. 保存寄存器到栈 */
+    for (size_t i = 0; i < saved_regs.size(); ++i) {
+        int off = save_offsets[i];
+        if (off >= -2048 && off < 2048) {
+            out << "    sw " << saved_regs[i] << ", " << off << "(sp)\n";
         } else {
-            // 关键修复：使用current_out_arg_base而不是temp_area_end
-            const int off = current_out_arg_base + (i - 8) * 4;
-            if (off >= -2048 && off < 2048) {
-                out << "    sw " << arg_reg << ", " << off << "(sp)\n";
-            } else {
-                std::string addr_reg = allocateRegister();
-                out << "    li " << addr_reg << ", " << off << "\n";
-                out << "    add " << addr_reg << ", sp, " << addr_reg << "\n";
-                out << "    sw " << arg_reg << ", 0(" << addr_reg << ")\n";
-                freeRegister(addr_reg);
-            }
+            out << "    li t5, " << off << "\n"
+                << "    add t5, sp, t5\n"
+                << "    sw " << saved_regs[i] << ", 0(t5)\n";
         }
-        freeRegister(arg_reg);
     }
 
-    // 调用函数
+    /* 3. 释放这些寄存器，供参数计算使用 */
+    for (const auto& r : saved_regs) reg_alloc.free(r);
+
+    /* 4. 计算并传递参数 */
+    std::vector<std::string> arg_regs;
+    for (int i = 0; i < n; ++i) {
+        arg_regs.push_back(generateExpr(node.args[i]));
+    }
+
+    for (int i = 0; i < n; ++i) {
+        if (i < 8) {
+            if (arg_regs[i] != "a" + std::to_string(i)) {
+                out << "    mv a" << i << ", " << arg_regs[i] << "\n";
+            }
+        } else {
+            int off = current_out_arg_base + (i - 8) * 4;
+            if (off >= -2048 && off < 2048) {
+                out << "    sw " << arg_regs[i] << ", " << off << "(sp)\n";
+            } else {
+                out << "    li t5, " << off << "\n"
+                    << "    add t5, sp, t5\n"
+                    << "    sw " << arg_regs[i] << ", 0(t5)\n";
+            }
+        }
+    }
+
+    /* 5. 释放参数寄存器 */
+    for (const auto& r : arg_regs) freeRegister(r);
+
+    /* 6. 调用函数 */
     out << "    jal ra, " << node.funcName << "\n";
 
-    // 恢复保存的寄存器
-    for (int i = static_cast<int>(saved_regs.size()) - 1; i >= 0; --i) {
-        const int offset = save_offsets[i];
-        if (offset >= -2048 && offset < 2048) {
-            out << "    lw " << saved_regs[i] << ", " << offset << "(sp)\n";
+    /* 7. 恢复保存的寄存器 */
+    for (size_t i = 0; i < saved_regs.size(); ++i) {
+        int off = save_offsets[i];
+        if (off >= -2048 && off < 2048) {
+            out << "    lw " << saved_regs[i] << ", " << off << "(sp)\n";
         } else {
-            std::string addr_reg = "t6";  // 使用固定的临时寄存器
-            out << "    li " << addr_reg << ", " << offset << "\n";
-            out << "    add " << addr_reg << ", sp, " << addr_reg << "\n";
-            out << "    lw " << saved_regs[i] << ", 0(" << addr_reg << ")\n";
+            out << "    li t5, " << off << "\n"
+                << "    add t5, sp, t5\n"
+                << "    lw " << saved_regs[i] << ", 0(t5)\n";
         }
     }
 
-    // 函数返回值在a0，分配寄存器保存
+    /* 8. 结果寄存器 */
     current_expr_result = allocateRegister();
     out << "    mv " << current_expr_result << ", a0\n";
 }
