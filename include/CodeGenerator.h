@@ -263,19 +263,18 @@ private:
     // 获取一个临时栈位置
 
     int getTempStackOffset() {
-        // 确保临时偏移在临时区范围内
         int offset = temp_area_start + temp_offset;
 
-        // 检查是否超出临时区边界
-        // temp_area_end不应该等于current_out_arg_base，应该有一定的间隔
-        if (offset >= temp_area_end - 8) {  // 留8字节的安全边界
-            // 如果超出，重置到临时区开始
+        // 检查是否超出临时区
+        if (offset + 4 > temp_area_end) {
+            // 重置到临时区开始
             temp_offset = 0;
             offset = temp_area_start;
         }
 
+        int result = offset;
         temp_offset += 4;
-        return offset;
+        return result;
     }
 
     // 分配寄存器或溢出

@@ -166,10 +166,10 @@ void CodeGenerator::visit(FuncDefNode& node) {
     // 出参区基址（栈顶方向）
     current_out_arg_base = frame_size;
 
-    // 保护：避免临时区和出参区、保存区重叠
+    /*// 保护：避免临时区和出参区、保存区重叠
     if (temp_area_end > frame_size - outgoing_space - frame_space) {
         temp_area_end = frame_size - outgoing_space - frame_space;
-    }
+    }*/
 
     // 7. 生成函数体
     node.block->accept(*this);
@@ -721,8 +721,10 @@ void CodeGenerator::visit(FuncCallExprNode& node) {
     // 1. 收集当前使用的临时寄存器
     std::vector<std::string> saved_regs;
     std::vector<int> save_offsets;
-    int save_base = temp_area_start; // 临时区起点
-    int save_off  = 0;
+
+    // 使用临时区保存寄存器
+    int save_base = temp_area_start + temp_offset;
+    int save_off = 0;
 
     for (int i = 0; i < RegisterAllocator::NUM_TEMP_REGS; ++i) {
         std::string treg = "t" + std::to_string(i);
@@ -733,22 +735,27 @@ void CodeGenerator::visit(FuncCallExprNode& node) {
         }
     }
 
+    // 更新temp_offset以避免覆盖
+    int saved_temp_offset = temp_offset;
+    temp_offset += save_off;
+
     // 2. 保存寄存器
     for (size_t i = 0; i < saved_regs.size(); ++i) {
         int off = save_offsets[i];
         if (off >= -2048 && off < 2048) {
-            out << "    sw " << saved_regs[i] << ", " << off << "(sp)\n";
+            out << "    sw " << saved_regs[i] << ", " << off << "(sp)  # save " << saved_regs[i] << "\n";
         } else {
-            std::string tmp = allocateRegister();
-            out << "    li " << tmp << ", " << off << "\n";
-            out << "    add " << tmp << ", sp, " << tmp << "\n";
-            out << "    sw " << saved_regs[i] << ", 0(" << tmp << ")\n";
-            freeRegister(tmp);
+            // 使用固定的辅助寄存器 a7 (或 s0) 来计算地址
+            out << "    li a7, " << off << "\n";
+            out << "    add a7, sp, a7\n";
+            out << "    sw " << saved_regs[i] << ", 0(a7)  # save " << saved_regs[i] << "\n";
         }
     }
 
-    // 3. 释放保存的寄存器，避免参数生成时寄存器短缺
-    for (const auto& r : saved_regs) reg_alloc.free(r);
+    // 3. 释放保存的寄存器，供参数计算使用
+    for (const auto& r : saved_regs) {
+        reg_alloc.free(r);
+    }
 
     // 4. 计算所有参数
     std::vector<std::string> arg_regs;
@@ -768,17 +775,17 @@ void CodeGenerator::visit(FuncCallExprNode& node) {
             if (off >= -2048 && off < 2048) {
                 out << "    sw " << arg_regs[i] << ", " << off << "(sp)\n";
             } else {
-                std::string tmp = allocateRegister();
-                out << "    li " << tmp << ", " << off << "\n";
-                out << "    add " << tmp << ", sp, " << tmp << "\n";
-                out << "    sw " << arg_regs[i] << ", 0(" << tmp << ")\n";
-                freeRegister(tmp);
+                out << "    li a7, " << off << "\n";
+                out << "    add a7, sp, a7\n";
+                out << "    sw " << arg_regs[i] << ", 0(a7)\n";
             }
         }
     }
 
     // 6. 释放参数寄存器
-    for (const auto& r : arg_regs) freeRegister(r);
+    for (const auto& r : arg_regs) {
+        freeRegister(r);
+    }
 
     // 7. 调用函数
     out << "    jal ra, " << node.funcName << "\n";
@@ -787,21 +794,23 @@ void CodeGenerator::visit(FuncCallExprNode& node) {
     for (int i = static_cast<int>(saved_regs.size()) - 1; i >= 0; --i) {
         int off = save_offsets[i];
         if (off >= -2048 && off < 2048) {
-            out << "    lw " << saved_regs[i] << ", " << off << "(sp)\n";
+            out << "    lw " << saved_regs[i] << ", " << off << "(sp)  # restore " << saved_regs[i] << "\n";
         } else {
-            std::string tmp = allocateRegister();
-            out << "    li " << tmp << ", " << off << "\n";
-            out << "    add " << tmp << ", sp, " << tmp << "\n";
-            out << "    lw " << saved_regs[i] << ", 0(" << tmp << ")\n";
-            freeRegister(tmp);
+            out << "    li a7, " << off << "\n";
+            out << "    add a7, sp, a7\n";
+            out << "    lw " << saved_regs[i] << ", 0(a7)  # restore " << saved_regs[i] << "\n";
         }
+        // 重新标记为已使用
+        reg_alloc.markUsed(saved_regs[i]);
     }
+
+    // 恢复temp_offset
+    temp_offset = saved_temp_offset;
 
     // 9. 保存返回值
     current_expr_result = allocateRegister();
     out << "    mv " << current_expr_result << ", a0\n";
 }
-
 void CodeGenerator::visit(CallStmtNode& node) {
     node.call->accept(*this);
     // 释放调用表达式使用的寄存器（无返回值需要保留）
@@ -957,15 +966,11 @@ int CodeGenerator::calculateTempSpaceNeed(const std::shared_ptr<BlockNode>& bloc
     int function_call_space = max_function_call_args * 4 + RegisterAllocator::NUM_TEMP_REGS * 4;
     int expression_space    = max_expression_depth * 8;
 
-    temp_space = std::max(temp_space, function_call_space + expression_space + max_arg_prep_space);
+    // 在返回前，确保有足够的空间
+    temp_space = std::max(temp_space, 1024); // 最小1KB
 
-    temp_space += 512; // 额外缓冲
-    if (max_function_call_args > 16) {
-        temp_space += (max_function_call_args - 16) * 8;
-    }
-
-    // 新增：寄存器保存区预留
-    temp_space += RegisterAllocator::NUM_TEMP_REGS * 4 + 16;
+    // 为寄存器保存预留空间（每个寄存器4字节，最多7个，加安全边界）
+    temp_space += RegisterAllocator::NUM_TEMP_REGS * 4 + 32;
 
     // 对齐到16B
     if (temp_space % 16 != 0) {
