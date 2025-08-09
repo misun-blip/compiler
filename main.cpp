@@ -10,7 +10,7 @@
 #include "SemanticAnalyzer.h"
 
 int main() {
-    system("chcp 65001");
+    // 移除 chcp 命令，因为它只在Windows上可用
     try {
 
          /*std::string inputFilename = "../test/19_many_arguments.tc";
@@ -66,7 +66,8 @@ int main() {
 
         /*//代码生成并输出到标准输出（已重定向到文件）
         CodeGenerator codegen(std::cout);*/
-         std::ofstream output("../result/compilation_result.txt");
+         // 修改输出文件路径为当前目录，确保在评测系统中能正常工作
+         std::ofstream output("compilation_result.txt");
          if (!output.is_open()) {
              throw std::runtime_error("无法打开输出文件");
          }
