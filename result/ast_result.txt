@@ -1,0 +1,14 @@
+CompUnitNode: {
+  FuncDefNode (line: 1, column: 1): int main() BlockNode (line: 1, column: 10): {
+    DeclStmtNode (line: 1, column: 11): int a = (PrimaryExprNode (line: 1, column: 16): 0);
+    DeclStmtNode (line: 1, column: 18): int b = (PrimaryExprNode (line: 1, column: 23): 1);
+    IfStmtNode (line: 1, column: 25): 
+      if (LAndExprNode (line: 1, column: 29): (PrimaryExprNode (line: 1, column: 28): a && PrimaryExprNode (line: 1, column: 31): MulExprNode (line: 1, column: 33): (PrimaryExprNode (line: 1, column: 32): b / PrimaryExprNode (line: 1, column: 34): a)))
+        BlockNode (line: 1, column: 37): {
+        ReturnStmtNode (line: 1, column: 38): return (PrimaryExprNode (line: 1, column: 44): 1);
+      }
+      else    BlockNode (line: 1, column: 51): {
+        ReturnStmtNode (line: 1, column: 52): return (PrimaryExprNode (line: 1, column: 58): 0);
+      }
+  }
+}

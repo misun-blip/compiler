@@ -1,0 +1,13 @@
+int fact(int n, int acc) {
+    if (n <= 1) {
+        return acc;
+    } else {
+        return fact(n - 1, n * acc);
+    }
+}
+
+int main() {
+    int result;
+    result = fact(5, 1);
+    return result;
+} 

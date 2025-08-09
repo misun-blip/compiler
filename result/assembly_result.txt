@@ -1,0 +1,47 @@
+.data
+
+.text
+.global main
+
+add:
+    # Function prologue
+    addi sp, sp, -264
+    sw ra, 260(sp)
+    sw fp, 256(sp)
+    addi fp, sp, 256
+    sw a0, -16(fp)
+    sw a1, -32(fp)
+    lw t1, -16(fp)
+    lw t2, -32(fp)
+    add t0, t1, t2
+    mv a0, t0
+    j add_epilogue
+add_epilogue:
+    # Function epilogue
+    lw ra, 4(fp)
+    lw fp, 0(fp)
+    addi sp, fp, 0
+    jr ra
+
+main:
+    # Function prologue
+    addi sp, sp, -264
+    sw ra, 260(sp)
+    sw fp, 256(sp)
+    addi fp, sp, 256
+    li t3, 3
+    mv a0, t3
+    li t4, 4
+    mv a1, t4
+    jal ra, add
+    sw a0, -16(fp)
+    lw t5, -16(fp)
+    mv a0, t5
+    j main_epilogue
+main_epilogue:
+    # Function epilogue
+    lw ra, 4(fp)
+    lw fp, 0(fp)
+    addi sp, fp, 0
+    jr ra
+

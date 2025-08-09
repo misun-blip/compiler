@@ -1,0 +1,56 @@
+<<<<<<< HEAD
+int main01(int argc,int argv){
+    // This is a comment
+    int a = 10;
+    /* This is a multi-line
+        comment */
+    int b = 20;
+    int c = 0;
+    //int e = a/(a-b/2);
+    int f = a+b / (a*2-b);
+    int c =  1 /* c */;
+    int d;  // This is a single-line comment
+    if(c>0){
+        d =a/ 0;
+    }
+    // This is another single-line comment
+    // This is a multi-line comment
+    else if(c<0){
+        d = c / 2;
+    }
+    else{
+        d = c;
+    }
+    /*asdadwawd*/
+    /*asdqwqewqwe*/
+    //dasdawd
+    /*int add(int a, int b){
+        return a + b;
+    }*/
+    //asdasd
+=======
+int main(){
+    int a = 10;//这是一条注释
+    int b = 20;
+    int c = 0;
+    int d;
+>>>>>>> origin/master2
+    while(c < 30){
+        c = c + 1;
+        if(c == 15){
+         continue;
+        }
+        else if(c == 20){
+            break;
+        }
+        else{
+            d = c * 2;
+        }
+    }
+<<<<<<< HEAD
+    
+}
+main01(1);
+=======
+}
+>>>>>>> origin/master2
