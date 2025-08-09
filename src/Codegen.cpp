@@ -304,6 +304,7 @@ void CodeGenerator::emitEpilogue(const int frame_size) const {
 
     out << "    jr ra\n";
 }
+
 std::string CodeGenerator::allocateRegister() {
     // 首先尝试正常分配
     std::string reg = reg_alloc.tryAllocate();
@@ -721,86 +722,89 @@ void CodeGenerator::visit(ParamNode& node) {
 void CodeGenerator::visit(FuncCallExprNode& node) {
     const int n = static_cast<int>(node.args.size());
 
-    /* 1. 收集并保存当前已占用的临时寄存器 */
+    // 1. 收集并保存当前使用的寄存器
     std::vector<std::string> saved_regs;
     std::vector<int> save_offsets;
     int save_base = temp_area_start;
     int save_off  = 0;
-
     for (int i = 0; i < RegisterAllocator::NUM_TEMP_REGS; ++i) {
-        std::string t = "t" + std::to_string(i);
-        if (reg_alloc.isUsed(t)) {
-            saved_regs.push_back(t);
+        std::string treg = "t" + std::to_string(i);
+        if (reg_alloc.isUsed(treg)) {
+            saved_regs.push_back(treg);
             save_offsets.push_back(save_base + save_off);
             save_off += 4;
         }
     }
 
-    /* 2. 保存寄存器到栈 */
+    // 保存这些寄存器
     for (size_t i = 0; i < saved_regs.size(); ++i) {
         int off = save_offsets[i];
         if (off >= -2048 && off < 2048) {
             out << "    sw " << saved_regs[i] << ", " << off << "(sp)\n";
         } else {
-            out << "    li t5, " << off << "\n"
-                << "    add t5, sp, t5\n"
-                << "    sw " << saved_regs[i] << ", 0(t5)\n";
+            // 使用一个安全的寄存器（例如 a5），它会被调用覆盖
+            out << "    li a5, " << off << "\n";
+            out << "    add a5, sp, a5\n";
+            out << "    sw " << saved_regs[i] << ", 0(a5)\n";
         }
     }
 
-    /* 3. 释放这些寄存器，供参数计算使用 */
-    for (const auto& r : saved_regs) reg_alloc.free(r);
+    // 释放标记，允许参数计算复用
+    for (auto &r : saved_regs) reg_alloc.free(r);
 
-    /* 4. 计算并传递参数 */
+    // 2. 先计算所有参数，保存到arg_regs
     std::vector<std::string> arg_regs;
     for (int i = 0; i < n; ++i) {
         arg_regs.push_back(generateExpr(node.args[i]));
     }
 
+    // 3. 传递参数
     for (int i = 0; i < n; ++i) {
         if (i < 8) {
             if (arg_regs[i] != "a" + std::to_string(i)) {
                 out << "    mv a" << i << ", " << arg_regs[i] << "\n";
             }
         } else {
-            int off = current_out_arg_base + (i - 8) * 4;
+            const int off = current_out_arg_base + (i - 8) * 4;
             if (off >= -2048 && off < 2048) {
                 out << "    sw " << arg_regs[i] << ", " << off << "(sp)\n";
             } else {
-                out << "    li t5, " << off << "\n"
-                    << "    add t5, sp, t5\n"
-                    << "    sw " << arg_regs[i] << ", 0(t5)\n";
+                out << "    li a5, " << off << "\n";
+                out << "    add a5, sp, a5\n";
+                out << "    sw " << arg_regs[i] << ", 0(a5)\n";
             }
         }
     }
 
-    /* 5. 释放参数寄存器 */
-    for (const auto& r : arg_regs) freeRegister(r);
+    // 释放参数寄存器
+    for (auto &r : arg_regs) freeRegister(r);
 
-    /* 6. 调用函数 */
+    // 4. 发起调用
     out << "    jal ra, " << node.funcName << "\n";
 
-    /* 7. 恢复保存的寄存器 */
-    for (size_t i = 0; i < saved_regs.size(); ++i) {
+    // 5. 恢复保存的寄存器（反向顺序）
+    for (int i = static_cast<int>(saved_regs.size()) - 1; i >= 0; --i) {
         int off = save_offsets[i];
         if (off >= -2048 && off < 2048) {
             out << "    lw " << saved_regs[i] << ", " << off << "(sp)\n";
         } else {
-            out << "    li t5, " << off << "\n"
-                << "    add t5, sp, t5\n"
-                << "    lw " << saved_regs[i] << ", 0(t5)\n";
+            out << "    li a5, " << off << "\n";
+            out << "    add a5, sp, a5\n";
+            out << "    lw " << saved_regs[i] << ", 0(a5)\n";
         }
     }
 
-    /* 8. 结果寄存器 */
+    // 6. 返回值传到新寄存器
     current_expr_result = allocateRegister();
     out << "    mv " << current_expr_result << ", a0\n";
 }
+
 void CodeGenerator::visit(CallStmtNode& node) {
     node.call->accept(*this);
     // 释放调用表达式使用的寄存器（无返回值需要保留）
     freeRegister(current_expr_result);
 }
+
 void CodeGenerator::generateCond(const std::shared_ptr<ExprNode>& expr, const std::string& falseLabel) {
     if (const auto andNode = std::dynamic_pointer_cast<LAndExprNode>(expr)) {
         generateCond(andNode->left, falseLabel);
