@@ -158,21 +158,17 @@ void CodeGenerator::visit(FuncDefNode& node) {
         current_off += 4;
     }
 
-    // 6. 设置各区域边界
-    stack_offset = param_space;  // 局部变量起始偏移
-    temp_area_start = stack_offset + local_space;  // 临时区起始偏移
+    // 形参结束后：
+    stack_offset = param_space;
+    temp_area_start = stack_offset + local_space;
+    temp_area_end   = temp_area_start + temp_space;
 
-    // 关键修复：临时区结束位置应该在出参区之前，留有足够空间
-    // 不要让temp_area_end等于current_out_arg_base
-    temp_area_end = temp_area_start + temp_space;  // 临时区结束位置
-
-    // 出参区基址（在栈帧的最高地址处）
+    // 出参区基址（栈顶方向）
     current_out_arg_base = frame_size;
 
-    // 确保临时区不会和出参区重叠
+    // 保护：避免临时区和出参区、保存区重叠
     if (temp_area_end > frame_size - outgoing_space - frame_space) {
-        // 如果临时区太大，调整它
-        temp_area_end = frame_size - outgoing_space - frame_space - 8; // 留8字节安全边界
+        temp_area_end = frame_size - outgoing_space - frame_space;
     }
 
     // 7. 生成函数体
@@ -722,11 +718,10 @@ void CodeGenerator::visit(ParamNode& node) {
 void CodeGenerator::visit(FuncCallExprNode& node) {
     const int n = static_cast<int>(node.args.size());
 
-    // 1. 收集当前正被使用的临时寄存器
+    // 1. 收集当前使用的临时寄存器
     std::vector<std::string> saved_regs;
     std::vector<int> save_offsets;
-
-    int save_base = temp_area_start; // 从临时区起始位置开始保存
+    int save_base = temp_area_start; // 临时区起点
     int save_off  = 0;
 
     for (int i = 0; i < RegisterAllocator::NUM_TEMP_REGS; ++i) {
@@ -744,7 +739,6 @@ void CodeGenerator::visit(FuncCallExprNode& node) {
         if (off >= -2048 && off < 2048) {
             out << "    sw " << saved_regs[i] << ", " << off << "(sp)\n";
         } else {
-            // 临时申请一个安全寄存器来计算地址
             std::string tmp = allocateRegister();
             out << "    li " << tmp << ", " << off << "\n";
             out << "    add " << tmp << ", sp, " << tmp << "\n";
@@ -753,10 +747,8 @@ void CodeGenerator::visit(FuncCallExprNode& node) {
         }
     }
 
-    // 3. 释放已保存寄存器，供参数计算分配使用
-    for (const auto& r : saved_regs) {
-        reg_alloc.free(r);
-    }
+    // 3. 释放保存的寄存器，避免参数生成时寄存器短缺
+    for (const auto& r : saved_regs) reg_alloc.free(r);
 
     // 4. 计算所有参数
     std::vector<std::string> arg_regs;
@@ -786,14 +778,12 @@ void CodeGenerator::visit(FuncCallExprNode& node) {
     }
 
     // 6. 释放参数寄存器
-    for (const auto& r : arg_regs) {
-        freeRegister(r);
-    }
+    for (const auto& r : arg_regs) freeRegister(r);
 
     // 7. 调用函数
     out << "    jal ra, " << node.funcName << "\n";
 
-    // 8. 恢复保存的寄存器
+    // 8. 恢复保存的寄存器（反向顺序）
     for (int i = static_cast<int>(saved_regs.size()) - 1; i >= 0; --i) {
         int off = save_offsets[i];
         if (off >= -2048 && off < 2048) {
@@ -807,7 +797,7 @@ void CodeGenerator::visit(FuncCallExprNode& node) {
         }
     }
 
-    // 9. 返回值寄存器 a0 -> 给当前表达式分配一个寄存器保存
+    // 9. 保存返回值
     current_expr_result = allocateRegister();
     out << "    mv " << current_expr_result << ", a0\n";
 }
@@ -858,11 +848,9 @@ void CodeGenerator::generateCondOr(const std::shared_ptr<LOrExprNode>& node, con
 
 // 计算临时空间需求
 int CodeGenerator::calculateTempSpaceNeed(const std::shared_ptr<BlockNode>& block) {
-    int temp_space = 256; // 基础临时空间
-    int max_function_call_args = 0; // 最大函数调用参数数量
-    int max_expression_depth = 0; // 最大表达式深度
-
-    // 添加：记录准备函数参数时需要的最大临时存储
+    int temp_space = 256; // 默认值
+    int max_function_call_args = 0;
+    int max_expression_depth = 0;
     int max_arg_prep_space = 0;
 
     std::function<void(const std::shared_ptr<BlockNode>&)> analyzeBlock;
@@ -873,11 +861,8 @@ int CodeGenerator::calculateTempSpaceNeed(const std::shared_ptr<BlockNode>& bloc
         if (const auto funcCall = std::dynamic_pointer_cast<FuncCallExprNode>(expr)) {
             max_function_call_args = std::max(max_function_call_args, static_cast<int>(funcCall->args.size()));
 
-            // 关键添加：计算准备参数需要的临时空间
-            // 每个复杂参数表达式可能需要临时存储
             int arg_prep_count = 0;
             for (const auto& arg : funcCall->args) {
-                // 如果参数是复杂表达式（不是简单变量或常量），需要临时存储
                 if (std::dynamic_pointer_cast<AddExprNode>(arg) ||
                     std::dynamic_pointer_cast<MulExprNode>(arg) ||
                     std::dynamic_pointer_cast<FuncCallExprNode>(arg)) {
@@ -892,29 +877,30 @@ int CodeGenerator::calculateTempSpaceNeed(const std::shared_ptr<BlockNode>& bloc
             }
             return depth;
         }
-        else if (const auto binaryExpr = std::dynamic_pointer_cast<AddExprNode>(expr)) {
-            return 1 + std::max(analyzeExpr(binaryExpr->left), analyzeExpr(binaryExpr->right));
+        // 针对 AddExprNode, MulExprNode, RelExprNode, LAndExprNode, LOrExprNode 分别处理
+        else if (const auto add = std::dynamic_pointer_cast<AddExprNode>(expr)) {
+            return 1 + std::max(analyzeExpr(add->left), analyzeExpr(add->right));
         }
-        else if (const auto binaryExpr = std::dynamic_pointer_cast<MulExprNode>(expr)) {
-            return 1 + std::max(analyzeExpr(binaryExpr->left), analyzeExpr(binaryExpr->right));
+        else if (const auto mul = std::dynamic_pointer_cast<MulExprNode>(expr)) {
+            return 1 + std::max(analyzeExpr(mul->left), analyzeExpr(mul->right));
         }
-        else if (const auto binaryExpr = std::dynamic_pointer_cast<RelExprNode>(expr)) {
-            return 1 + std::max(analyzeExpr(binaryExpr->left), analyzeExpr(binaryExpr->right));
+        else if (const auto rel = std::dynamic_pointer_cast<RelExprNode>(expr)) {
+            return 1 + std::max(analyzeExpr(rel->left), analyzeExpr(rel->right));
         }
-        else if (const auto binaryExpr = std::dynamic_pointer_cast<LAndExprNode>(expr)) {
-            return 1 + std::max(analyzeExpr(binaryExpr->left), analyzeExpr(binaryExpr->right));
+        else if (const auto lor = std::dynamic_pointer_cast<LOrExprNode>(expr)) {
+            return 1 + std::max(analyzeExpr(lor->left), analyzeExpr(lor->right));
         }
-        else if (const auto binaryExpr = std::dynamic_pointer_cast<LOrExprNode>(expr)) {
-            return 1 + std::max(analyzeExpr(binaryExpr->left), analyzeExpr(binaryExpr->right));
+        else if (const auto land = std::dynamic_pointer_cast<LAndExprNode>(expr)) {
+            return 1 + std::max(analyzeExpr(land->left), analyzeExpr(land->right));
         }
-        else if (const auto unaryExpr = std::dynamic_pointer_cast<UnaryExprNode>(expr)) {
-            return 1 + analyzeExpr(unaryExpr->expr);
+        else if (const auto unary = std::dynamic_pointer_cast<UnaryExprNode>(expr)) {
+            return 1 + analyzeExpr(unary->expr);
         }
-        return 1; // 基本表达式
+        return 1;
     };
 
-    analyzeBlock = [&](const std::shared_ptr<BlockNode>& current_block) {
-        for (const auto& stmt : current_block->stmts) {
+    analyzeBlock = [&](const std::shared_ptr<BlockNode>& blk) {
+        for (const auto& stmt : blk->stmts) {
             if (const auto exprStmt = std::dynamic_pointer_cast<ExprStmtNode>(stmt)) {
                 max_expression_depth = std::max(max_expression_depth, analyzeExpr(exprStmt->expr));
             }
@@ -928,20 +914,17 @@ int CodeGenerator::calculateTempSpaceNeed(const std::shared_ptr<BlockNode>& bloc
             }
             else if (const auto ifStmt = std::dynamic_pointer_cast<IfStmtNode>(stmt)) {
                 max_expression_depth = std::max(max_expression_depth, analyzeExpr(ifStmt->cond));
-                if (auto thenBlock = std::dynamic_pointer_cast<BlockNode>(ifStmt->thenStmt)) {
+                if (auto thenBlock = std::dynamic_pointer_cast<BlockNode>(ifStmt->thenStmt))
                     analyzeBlock(thenBlock);
-                }
                 if (ifStmt->elseStmt) {
-                    if (auto elseBlock = std::dynamic_pointer_cast<BlockNode>(ifStmt->elseStmt)) {
+                    if (auto elseBlock = std::dynamic_pointer_cast<BlockNode>(ifStmt->elseStmt))
                         analyzeBlock(elseBlock);
-                    }
                 }
             }
             else if (const auto whileStmt = std::dynamic_pointer_cast<WhileStmtNode>(stmt)) {
                 max_expression_depth = std::max(max_expression_depth, analyzeExpr(whileStmt->cond));
-                if (auto bodyBlock = std::dynamic_pointer_cast<BlockNode>(whileStmt->body)) {
+                if (auto bodyBlock = std::dynamic_pointer_cast<BlockNode>(whileStmt->body))
                     analyzeBlock(bodyBlock);
-                }
             }
             else if (const auto returnStmt = std::dynamic_pointer_cast<ReturnStmtNode>(stmt)) {
                 if (returnStmt->retExpr) {
@@ -951,8 +934,6 @@ int CodeGenerator::calculateTempSpaceNeed(const std::shared_ptr<BlockNode>& bloc
             else if (const auto callStmt = std::dynamic_pointer_cast<CallStmtNode>(stmt)) {
                 if (const auto funcCall = std::dynamic_pointer_cast<FuncCallExprNode>(callStmt->call)) {
                     max_function_call_args = std::max(max_function_call_args, static_cast<int>(funcCall->args.size()));
-
-                    // 关键添加：CallStmt也需要计算参数准备空间
                     int arg_prep_count = 0;
                     for (const auto& arg : funcCall->args) {
                         if (std::dynamic_pointer_cast<AddExprNode>(arg) ||
@@ -965,27 +946,30 @@ int CodeGenerator::calculateTempSpaceNeed(const std::shared_ptr<BlockNode>& bloc
                     max_arg_prep_space = std::max(max_arg_prep_space, arg_prep_count * 4);
                 }
             }
-            else if (auto blockStmt = std::dynamic_pointer_cast<BlockNode>(stmt)) {
-                analyzeBlock(blockStmt);
+            else if (auto subBlk = std::dynamic_pointer_cast<BlockNode>(stmt)) {
+                analyzeBlock(subBlk);
             }
         }
     };
 
     analyzeBlock(block);
 
-    // 根据分析结果计算临时空间需求
-    int function_call_space = max_function_call_args * 4 + 7 * 4; // 7个临时寄存器溢出
-    int expression_space = max_expression_depth * 8; // 每层8字节
+    int function_call_space = max_function_call_args * 4 + RegisterAllocator::NUM_TEMP_REGS * 4;
+    int expression_space    = max_expression_depth * 8;
 
-    // 确保有足够的参数准备空间和寄存器保存空间
     temp_space = std::max(temp_space, function_call_space + expression_space + max_arg_prep_space);
 
-    // 增加更多的缓冲空间，避免溢出
-    temp_space += 512;  // 增加到512字节的额外缓冲区
-
-    // 对于有很多函数调用的函数，需要更多空间
+    temp_space += 512; // 额外缓冲
     if (max_function_call_args > 16) {
-        temp_space += (max_function_call_args - 16) * 8;  // 每个额外参数8字节
+        temp_space += (max_function_call_args - 16) * 8;
+    }
+
+    // 新增：寄存器保存区预留
+    temp_space += RegisterAllocator::NUM_TEMP_REGS * 4 + 16;
+
+    // 对齐到16B
+    if (temp_space % 16 != 0) {
+        temp_space = ((temp_space / 16) + 1) * 16;
     }
 
     return temp_space;
