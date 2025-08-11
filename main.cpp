@@ -10,7 +10,6 @@
 #include "SemanticAnalyzer.h"
 
 int main() {
-    system("chcp 65001");
     try {
         // 从文件读取源代码
         // std::string inputFilename = "../test/19_many_arguments.tc";

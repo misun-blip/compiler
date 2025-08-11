@@ -808,21 +808,23 @@ void CodeGenerator::visit(FuncCallExprNode& node) {
         out << "    addi sp, sp, -4\n";
 
         const int offset = arg_stack_offsets[i];
-        std::string temp = "t0";  // 使用固定的临时寄存器
-
+        // 这里是调用参数压栈时，处理 offset 对应的值
+        std::string temp = "t0";  // 临时寄存器
+        // 注意：此时 sp 未做额外调整，所以直接用 offset
         if (offset >= -2048 && offset < 2048) {
-            out << "    lw " << temp << ", " << offset + 4 << "(sp)\n";  // +4因为我们刚调整了sp
-        }
-        else {
+            out << "    lw " << temp << ", " << offset << "(sp)\n";
+        } else {
+            // 临时保存 t5
             out << "    addi sp, sp, -8\n";
             out << "    sw t5, 0(sp)\n";
-            out << "    li t5, " << (offset + 12) << "\n";  // +12 = +4 (sp调整) + 8 (临时保存t5)
+            out << "    li t5, " << offset << "\n";
             out << "    add t5, sp, t5\n";
             out << "    lw " << temp << ", 0(t5)\n";
             out << "    lw t5, 0(sp)\n";
             out << "    addi sp, sp, 8\n";
         }
 
+        // 把取出来的参数值存到调用栈上的临时位置
         out << "    sw " << temp << ", 0(sp)\n";
     }
 
