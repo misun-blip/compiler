@@ -230,84 +230,43 @@ void CodeGenerator::alignStack(int& offset) {
     }
 }
 
-void CodeGenerator::emitPrologue(const int local_size) const {
+void CodeGenerator::emitPrologue(int local_size) const {
     out << "    # Function prologue\n";
 
-    // 检查栈大小是否超出立即数范围
-    if (local_size >= -2048 && local_size < 2048) {
-        out << "    addi sp, sp, -" << local_size << "\n";
-    }
-    else {
-        // 使用寄存器来处理大的栈偏移
-        out << "    li t0, " << local_size << "\n";
+    // 对齐栈
+    int stack_size = local_size + 8; // 额外保存 ra 和 fp
+    alignStack(stack_size);
+
+    if (stack_size >= -2048 && stack_size < 2048) {
+        out << "    addi sp, sp, -" << stack_size << "\n";
+    } else {
+        out << "    li t0, " << stack_size << "\n";
         out << "    sub sp, sp, t0\n";
     }
 
     // 保存 ra 和 fp
-    const int ra_offset = local_size - 4;
-    const int fp_offset = local_size - 8;
+    out << "    sw ra, 0(sp)\n";
+    out << "    sw fp, 4(sp)\n";
 
-    if (ra_offset >= -2048 && ra_offset < 2048) {
-        out << "    sw ra, " << ra_offset << "(sp)\n";
-    }
-    else {
-        out << "    li t0, " << ra_offset << "\n";
-        out << "    add t0, sp, t0\n";
-        out << "    sw ra, 0(t0)\n";
-    }
-
-    if (fp_offset >= -2048 && fp_offset < 2048) {
-        out << "    sw fp, " << fp_offset << "(sp)\n";
-    }
-    else {
-        out << "    li t0, " << fp_offset << "\n";
-        out << "    add t0, sp, t0\n";
-        out << "    sw fp, 0(t0)\n";
-    }
-
-    // 设置新的 fp
-    if (local_size >= -2048 && local_size < 2048) {
-        out << "    addi fp, sp, " << local_size << "\n";
-    }
-    else {
-        out << "    li t0, " << local_size << "\n";
-        out << "    add fp, sp, t0\n";
-    }
+    // 设置新的 fp（指向保存 fp 之后的位置）
+    out << "    addi fp, sp, " << stack_size << "\n";
 }
 
-void CodeGenerator::emitEpilogue(const int local_size) const {
+void CodeGenerator::emitEpilogue(int local_size) const {
     out << "    # Function epilogue\n";
 
-    // 恢复 ra 和 fp
-    const int ra_offset = local_size - 4;
-    const int fp_offset = local_size - 8;
+    int stack_size = local_size + 8;
+    alignStack(stack_size);
 
-    if (ra_offset >= -2048 && ra_offset < 2048) {
-        out << "    lw ra, " << ra_offset << "(sp)\n";
-    }
-    else {
-        out << "    li t0, " << ra_offset << "\n";
-        out << "    add t0, sp, t0\n";
-        out << "    lw ra, 0(t0)\n";
-    }
+    out << "    lw ra, 0(sp)\n";
+    out << "    lw fp, 4(sp)\n";
 
-    if (fp_offset >= -2048 && fp_offset < 2048) {
-        out << "    lw fp, " << fp_offset << "(sp)\n";
-    }
-    else {
-        out << "    li t0, " << fp_offset << "\n";
-        out << "    add t0, sp, t0\n";
-        out << "    lw fp, 0(t0)\n";
-    }
-    // 恢复栈指针，释放所有分配的栈空间
-    if (local_size >= -2048 && local_size < 2048) {
-        out << "    addi sp, sp, " << local_size << "\n";
-    }
-    else {
-        out << "    li t0, " << local_size << "\n";
+    if (stack_size >= -2048 && stack_size < 2048) {
+        out << "    addi sp, sp, " << stack_size << "\n";
+    } else {
+        out << "    li t0, " << stack_size << "\n";
         out << "    add sp, sp, t0\n";
     }
-
     out << "    jr ra\n";
 }
 
