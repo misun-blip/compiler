@@ -10,19 +10,20 @@
 #include "SemanticAnalyzer.h"
 
 int main() {
+    system("chcp 65001");
     try {
-         /*//从文件读取源代码
-        std::string inputFilename = "../test/19_many_arguments.tc";
-        std::ifstream File(inputFilename);
-        if (!File.is_open()) {
-            std::cerr << "error: file " << inputFilename << " not found or not accessible" << std::endl;
-            return 1;
-        }
-        std::string inputCode;
-        std::string line;
-        while (std::getline(File, line)) {
-            inputCode += line + '\n';
-        }*/
+        // 从文件读取源代码
+        // std::string inputFilename = "../test/19_many_arguments.tc";
+        // std::ifstream File(inputFilename);
+        // if (!File.is_open()) {
+        //     std::cerr << "error: file " << inputFilename << " not found or not accessible" << std::endl;
+        //     return 1;
+        // }
+        // std::string inputCode;
+        // std::string line;
+        // while (std::getline(File, line)) {
+        //     inputCode += line + '\n';
+        // }
 
         // 从标准输入读取源代码
         std::string inputCode;
@@ -65,11 +66,11 @@ int main() {
 
         //代码生成并输出到标准输出（已重定向到文件）
         CodeGenerator codegen(std::cout);
-          /*std::ofstream output("../result/compilation_result.txt");
-        if (!output.is_open()) {
-          throw std::runtime_error("无法打开输出文件");
-         }
-         CodeGenerator codegen(output);*/
+        //  std::ofstream output("../result/compilation_result.txt");
+        //  if (!output.is_open()) {
+        //      throw std::runtime_error("无法打开输出文件");
+        //  }
+        // CodeGenerator codegen(output);
         codegen.generate(compUnit);
 
     } catch (const SemanticError& e) {

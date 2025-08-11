@@ -20,10 +20,9 @@ void CodeGenerator::generate(const std::shared_ptr<CompUnitNode>& root) {
     out << ".text\n";
     out << ".global main\n\n";
 
-    // 生成各函数代码
+    // 生成代码
     root->accept(*this);
 }
-
 
 void CodeGenerator::visit(CompUnitNode& node) {
     for (const auto& func : node.funcDefs) {
@@ -31,120 +30,194 @@ void CodeGenerator::visit(CompUnitNode& node) {
     }
 }
 
-void CodeGenerator::storeWord(const std::string& src_reg, int offset, const std::string& base_reg) {
-    if (offset >= -2048 && offset < 2048) {
-        out << "    sw " << src_reg << ", " << offset << "(" << base_reg << ")\n";
-    } else {
-        out << "    li a7, " << offset << "\n";
-        out << "    add a7, " << base_reg << ", a7\n";
-        out << "    sw " << src_reg << ", 0(a7)\n";
-    }
-}
-
-void CodeGenerator::loadWord(const std::string& dest_reg, int offset, const std::string& base_reg) {
-    if (offset >= -2048 && offset < 2048) {
-        out << "    lw " << dest_reg << ", " << offset << "(" << base_reg << ")\n";
-    } else {
-        out << "    li a7, " << offset << "\n";
-        out << "    add a7, " << base_reg << ", a7\n";
-        out << "    lw " << dest_reg << ", 0(a7)\n";
-    }
-}
-
 void CodeGenerator::visit(FuncDefNode& node) {
     current_function = node.id;
-    reg_alloc.reset();
+    stack_offset = 0;   //
+    temp_offset = 0;    //
+
+    // 重置寄存器分配器
+    reg_alloc.reset();  //每个函数都需要重置分配器
+
+    // 清空溢出栈
     while (!spill_stack.empty()) {
         spill_stack.pop();
     }
 
+    // 函数标签
     out << node.id << ":\n";
+
+    // 进入新的作用域
     sym_table.enterScope();
 
-    // 计算空间（不预分配outgoing_space）
-    const int frame_space = 8;  // ra(4B) + fp(4B)
-    const int param_space = static_cast<int>(node.params.size()) * 4;
-    const int local_space = calculateLocalSpace(node.block);
-    int temp_space = calculateTempSpaceNeed(node.block);
+    // 被调用函数的栈帧（局部变量空间，临时变量空间和保存的返回地址）
+    int temp_space = calculateTempSpaceNeed(node.block); // 智能计算临时空间
+    const int local_space = calculateLocalSpace(node.block);    // 局部变量空间
+    constexpr int frame_space = 8; // ra和fp各4字节
 
-    // 总帧大小
-    int frame_size = param_space + local_space + temp_space + frame_space;
-    alignStack(frame_size);
-    current_function_stack_size = frame_size;
-
-    // 生成序言
-    emitPrologue(frame_size);
-
-    // 处理形参 - 使用fp负偏移
-    for (size_t i = 0; i < node.params.size(); ++i) {
-        const std::string& param_id = node.params[i]->id;
-        const int local_off = -static_cast<int>((i + 1) * 4);  // 负偏移
-        if (i < 8) {
-            storeWord("a" + std::to_string(i), local_off);
-        } else {
-            const int incoming_off = (i - 8) * 4;
-            std::string temp_reg = allocateRegister();
-            loadWord(temp_reg, incoming_off);  // incoming_off 正，相对fp
-            storeWord(temp_reg, local_off);
-            freeRegister(temp_reg);
-        }
-
-        sym_table.addSymbol(param_id, local_off, true, static_cast<int>(i));
+    // 如果有很多参数，增加临时空间
+    if (node.params.size() > 8) {
+        temp_space += (static_cast<int>(node.params.size()) - 8) * 8;
     }
 
-    // 设置局部变量起始偏移
-    current_stack_off = -param_space - 4;  // 负偏移，跳过参数
+    const int param_space = std::max(0, static_cast<int>(node.params.size()) * 4);
 
-    // 临时区（使用fp负偏移）
-    temp_area_start = -param_space - local_space;
-    temp_area_end = temp_area_start - temp_space;
+
+    // 如果是递归函数（简单检测），适度增加临时空间
+    bool is_recursive = false;
+    const std::function<void(const std::shared_ptr<StmtNode>&)> checkRecursive =
+        [&](const std::shared_ptr<StmtNode>& stmt) {
+        if (const auto expr_stmt = std::dynamic_pointer_cast<ExprStmtNode>(stmt)) {
+            if (const auto call = std::dynamic_pointer_cast<FuncCallExprNode>(expr_stmt->expr)) {
+                if (call->funcName == node.id) {
+                    is_recursive = true;
+                }
+            }
+        }
+        else if (const auto call_stmt = std::dynamic_pointer_cast<CallStmtNode>(stmt)) {
+            if (const auto call = std::dynamic_pointer_cast<FuncCallExprNode>(call_stmt->call)) {
+                if (call->funcName == node.id) {
+                    is_recursive = true;
+                }
+            }
+        }
+        else if (const auto return_stmt = std::dynamic_pointer_cast<ReturnStmtNode>(stmt)) {
+            if (return_stmt->retExpr) {
+                if (const auto call = std::dynamic_pointer_cast<FuncCallExprNode>(return_stmt->retExpr)) {
+                    if (call->funcName == node.id) {
+                        is_recursive = true;
+                    }
+                }
+            }
+        }
+        };
+
+    // 简单检查是否有递归调用
+    for (const auto& stmt : node.block->stmts) {
+        checkRecursive(stmt);
+        if (is_recursive) break;
+    }
+
+    if (is_recursive) {
+        temp_space = std::min(temp_space + 256, 1024); // 递归函数最多1024字节临时空间
+    }
+
+    //计算被调用者函数的总栈空间（局部变量空间，临时变量空间，栈帧指针空间和参数空间）
+    int total_space = param_space + local_space + frame_space + temp_space;
+
+    // 16字节对齐
+    alignStack(total_space);
+
+    // 存储总栈空间大小，用于边界检查
+    current_function_stack_size = total_space;
+
+    // 生成函数序言
+    emitPrologue(total_space);
+
+    // 处理参数
+    int current_offset = 0;   // 当前栈帧偏移量
+    for (size_t i = 0; i < node.params.size(); ++i) {
+        if (i < 8) {
+            // 前8个参数通过寄存器传递，保存到栈中
+            if (current_offset >= -2048 && current_offset < 2048) {
+                out << "    sw a" << i << ", " << current_offset << "(sp)\n";
+            }
+            else {
+                // 偏移量太大，需要先计算地址
+                std::string addr_reg = allocateRegister();
+                out << "    li " << addr_reg << ", " << current_offset << "\n";
+                out << "    add " << addr_reg << ", sp, " << addr_reg << "\n";
+                out << "    sw a" << i << ", 0(" << addr_reg << ")\n";
+                freeRegister(addr_reg);
+            }
+            sym_table.addSymbol(node.params[i]->id, current_offset, true, static_cast<int>(i));
+            current_offset += 4;
+        }
+        else {
+            // 超过8个的参数通过栈传递
+            //const int param_offset = total_space + (static_cast<int>(i) - 8) * 4;
+            const int caller_offset = current_offset + local_space + temp_space + frame_space + (static_cast<int>(i) - 8) * 4;
+            // 对于通过栈传递的参数，需要特别处理大偏移量
+            if (caller_offset >= 2048) {
+                // 为栈传递的参数分配局部空间
+                sym_table.addSymbol(node.params[i]->id, current_offset, true, static_cast<int>(i));
+
+                // 在函数开始时，将栈参数复制到局部空间
+                std::string temp_reg = allocateRegister();
+                out << "    li " << temp_reg << ", " << caller_offset << "\n";
+                out << "    add " << temp_reg << ", sp, " << temp_reg << "\n";
+                out << "    lw t1, 0(" << temp_reg << ")\n";
+                out << "    sw t1, " << current_offset << "(sp)\n";
+                freeRegister(temp_reg);
+
+                current_offset += 4;
+            }
+            else {
+                sym_table.addSymbol(node.params[i]->id, caller_offset, true, static_cast<int>(i));
+            }
+        }
+    }
+
+    // 设置局部变量的起始偏移量
+    stack_offset = current_offset;
+
+    // 设置临时区域的起始偏移量
+    temp_area_start = stack_offset +local_space; // 临时区域 = 参数区 + 局部变量区
+    temp_offset = temp_area_start;
+    // 设置临时区域的结束边界（预留frame_space给ra和fp）
+    temp_area_end = total_space - frame_space;
 
     // 生成函数体
     node.block->accept(*this);
 
-    // main默认返回0
+    // 如果是main函数且没有显式return，添加默认返回
     if (node.id == "main") {
         out << "    li a0, 0\n";
     }
 
-    // 尾声
+    // 生成函数尾声标签
     out << current_function << "_epilogue:\n";
-    emitEpilogue(frame_size);
+    emitEpilogue(total_space);
 
+    // 退出作用域
     sym_table.exitScope();
+
     out << "\n";
 }
+
 // 计算局部变量的空间需求
 int CodeGenerator::calculateLocalSpace(const std::shared_ptr<BlockNode>& block) {
     int space = 0;
+    std::set<std::string> declared_vars;    // 记录声明过的变量
 
     std::function<void(const std::shared_ptr<BlockNode>&)> calculateSpace =
         [&](const std::shared_ptr<BlockNode>& current_block) {
-            for (const auto& stmt : current_block->stmts) {
-                if (const auto decl = std::dynamic_pointer_cast<DeclStmtNode>(stmt)) {
-                    // 每个声明都需要空间，即使变量名相同（在不同作用域）
-                    space += 4;
-                }
-                else if (const auto if_stmt = std::dynamic_pointer_cast<IfStmtNode>(stmt)) {
-                    if (auto then_block = std::dynamic_pointer_cast<BlockNode>(if_stmt->thenStmt)) {
-                        calculateSpace(then_block);
-                    }
-                    if (if_stmt->elseStmt) {
-                        if (auto else_block = std::dynamic_pointer_cast<BlockNode>(if_stmt->elseStmt)) {
-                            calculateSpace(else_block);
-                        }
-                    }
-                }
-                else if (const auto while_stmt = std::dynamic_pointer_cast<WhileStmtNode>(stmt)) {
-                    if (auto body_block = std::dynamic_pointer_cast<BlockNode>(while_stmt->body)) {
-                        calculateSpace(body_block);
-                    }
-                }
-                else if (auto block_stmt = std::dynamic_pointer_cast<BlockNode>(stmt)) {
-                    calculateSpace(block_stmt);
+        for (const auto& stmt : current_block->stmts) {
+            if (const auto decl = std::dynamic_pointer_cast<DeclStmtNode>(stmt)) {
+                if (declared_vars.find(decl->id) == declared_vars.end()) {  // 变量没有声明过
+                    space += 4;                                             // 变量占用4字节
+                    declared_vars.insert(decl->id);                         // 记录声明
                 }
             }
-    };
+            else if (const auto if_stmt = std::dynamic_pointer_cast<IfStmtNode>(stmt)) {
+                if (auto then_block = std::dynamic_pointer_cast<BlockNode>(if_stmt->thenStmt)) {
+                    calculateSpace(then_block);
+                }
+                if (if_stmt->elseStmt) {
+                    if (auto else_block = std::dynamic_pointer_cast<BlockNode>(if_stmt->elseStmt)) {
+                        calculateSpace(else_block);
+                    }
+                }
+            }
+            else if (const auto while_stmt = std::dynamic_pointer_cast<WhileStmtNode>(stmt)) {
+                if (auto body_block = std::dynamic_pointer_cast<BlockNode>(while_stmt->body)) {
+                    calculateSpace(body_block);
+                }
+            }
+            else if (auto block_stmt = std::dynamic_pointer_cast<BlockNode>(stmt)) {
+                calculateSpace(block_stmt);
+            }
+        }
+        };
 
     calculateSpace(block);
     return space;
@@ -157,69 +230,81 @@ void CodeGenerator::alignStack(int& offset) {
     }
 }
 
-void CodeGenerator::emitPrologue(const int frame_size) const {
+void CodeGenerator::emitPrologue(const int local_size) const {
     out << "    # Function prologue\n";
 
-    if (frame_size >= -2048 && frame_size < 2048) {
-        out << "    addi sp, sp, -" << frame_size << "\n";
-    } else {
-        out << "    li t0, " << frame_size << "\n";
+    // 检查栈大小是否超出立即数范围
+    if (local_size >= -2048 && local_size < 2048) {
+        out << "    addi sp, sp, -" << local_size << "\n";
+    }
+    else {
+        // 使用寄存器来处理大的栈偏移
+        out << "    li t0, " << local_size << "\n";
         out << "    sub sp, sp, t0\n";
     }
 
-    const int ra_off = frame_size - 4;
-    const int fp_off = frame_size - 8;
+    // 保存 ra 和 fp
+    const int ra_offset = local_size - 4;
+    const int fp_offset = local_size - 8;
 
-    if (ra_off >= -2048 && ra_off < 2048) {
-        out << "    sw ra, " << ra_off << "(sp)\n";
-    } else {
-        out << "    li t0, " << ra_off << "\n";
+    if (ra_offset >= -2048 && ra_offset < 2048) {
+        out << "    sw ra, " << ra_offset << "(sp)\n";
+    }
+    else {
+        out << "    li t0, " << ra_offset << "\n";
         out << "    add t0, sp, t0\n";
         out << "    sw ra, 0(t0)\n";
     }
 
-    if (fp_off >= -2048 && fp_off < 2048) {
-        out << "    sw fp, " << fp_off << "(sp)\n";
-    } else {
-        out << "    li t0, " << fp_off << "\n";
+    if (fp_offset >= -2048 && fp_offset < 2048) {
+        out << "    sw fp, " << fp_offset << "(sp)\n";
+    }
+    else {
+        out << "    li t0, " << fp_offset << "\n";
         out << "    add t0, sp, t0\n";
         out << "    sw fp, 0(t0)\n";
     }
 
-    if (frame_size >= -2048 && frame_size < 2048) {
-        out << "    addi fp, sp, " << frame_size << "\n";
-    } else {
-        out << "    li t0, " << frame_size << "\n";
+    // 设置新的 fp
+    if (local_size >= -2048 && local_size < 2048) {
+        out << "    addi fp, sp, " << local_size << "\n";
+    }
+    else {
+        out << "    li t0, " << local_size << "\n";
         out << "    add fp, sp, t0\n";
     }
 }
 
-void CodeGenerator::emitEpilogue(const int frame_size) const {
+void CodeGenerator::emitEpilogue(const int local_size) const {
     out << "    # Function epilogue\n";
 
-    const int ra_off = frame_size - 4;
-    const int fp_off = frame_size - 8;
+    // 恢复 ra 和 fp
+    const int ra_offset = local_size - 4;
+    const int fp_offset = local_size - 8;
 
-    if (ra_off >= -2048 && ra_off < 2048) {
-        out << "    lw ra, " << ra_off << "(sp)\n";
-    } else {
-        out << "    li t0, " << ra_off << "\n";
+    if (ra_offset >= -2048 && ra_offset < 2048) {
+        out << "    lw ra, " << ra_offset << "(sp)\n";
+    }
+    else {
+        out << "    li t0, " << ra_offset << "\n";
         out << "    add t0, sp, t0\n";
         out << "    lw ra, 0(t0)\n";
     }
 
-    if (fp_off >= -2048 && fp_off < 2048) {
-        out << "    lw fp, " << fp_off << "(sp)\n";
-    } else {
-        out << "    li t0, " << fp_off << "\n";
+    if (fp_offset >= -2048 && fp_offset < 2048) {
+        out << "    lw fp, " << fp_offset << "(sp)\n";
+    }
+    else {
+        out << "    li t0, " << fp_offset << "\n";
         out << "    add t0, sp, t0\n";
         out << "    lw fp, 0(t0)\n";
     }
-
-    if (frame_size >= -2048 && frame_size < 2048) {
-        out << "    addi sp, sp, " << frame_size << "\n";
-    } else {
-        out << "    li t0, " << frame_size << "\n";
+    // 恢复栈指针，释放所有分配的栈空间
+    if (local_size >= -2048 && local_size < 2048) {
+        out << "    addi sp, sp, " << local_size << "\n";
+    }
+    else {
+        out << "    li t0, " << local_size << "\n";
         out << "    add sp, sp, t0\n";
     }
 
@@ -227,14 +312,17 @@ void CodeGenerator::emitEpilogue(const int frame_size) const {
 }
 
 std::string CodeGenerator::allocateRegister() {
+    // 首先尝试正常分配
     std::string reg = reg_alloc.tryAllocate();
     if (!reg.empty()) {
         return reg;
     }
 
+    // 如果没有空闲寄存器，强制分配
     auto [forced_reg, spill_offset] = reg_alloc.forceAllocate(out, getTempStackOffset());
-    if (spill_offset != -1) {  // 改为 != -1，因为-1表示无溢出
-        spill_stack.emplace(forced_reg, spill_offset);
+    if (spill_offset >= 0) {
+        // 记录溢出信息
+        spill_stack.emplace( forced_reg, spill_offset );
     }
     return forced_reg;
 }
@@ -242,11 +330,27 @@ std::string CodeGenerator::allocateRegister() {
 void CodeGenerator::freeRegister(const std::string& reg) {
     reg_alloc.free(reg);
 
+    // 检查是否需要恢复溢出的值
     if (!spill_stack.empty() && spill_stack.top().first == reg) {
         auto [spilled_reg, offset] = spill_stack.top();
         spill_stack.pop();
-        loadWord(spilled_reg, offset);  // 统一用loadWord
-        out << "  # restore\n";  // 可选注释
+
+        // 检查偏移量是否在立即数范围内
+        if (offset >= -2048 && offset < 2048) {
+            out << "    lw " << spilled_reg << ", " << offset << "(sp)  # restore\n";
+        }
+        else {
+            // 需要使用临时寄存器来计算地址
+            out << "    addi sp, sp, -8\n";
+            out << "    sw t5, 0(sp)  # save t5\n";
+            out << "    li t5, " << offset << "\n";
+            out << "    add t5, sp, t5\n";
+            out << "    addi t5, t5, 8\n";  // 补偿临时调整的sp
+            out << "    lw " << spilled_reg << ", 0(t5)  # restore\n";
+            out << "    lw t5, 0(sp)  # restore t5\n";
+            out << "    addi sp, sp, 8\n";
+        }
+        // 不要再次标记为使用，因为我们刚刚释放了它
     }
 }
 
@@ -286,22 +390,64 @@ void CodeGenerator::visit(AssignStmtNode& node) {
     if (!sym) {
         throw std::runtime_error("Undefined variable: " + node.id);
     }
-    storeWord(result_reg, sym->offset);
+
+    // 检查偏移量是否在立即数范围内
+    if (sym->offset >= -2048 && sym->offset < 2048) {
+        out << "    sw " << result_reg << ", " << sym->offset << "(sp)\n";
+    }
+    else {
+        // 偏移量太大，需要先计算地址
+        const std::string addr_reg = allocateRegister();
+        out << "    li " << addr_reg << ", " << sym->offset << "\n";
+        out << "    add " << addr_reg << ", sp, " << addr_reg << "\n";
+        out << "    sw " << result_reg << ", 0(" << addr_reg << ")\n";
+        freeRegister(addr_reg);
+    }
+
     freeRegister(result_reg);
 }
 
 void CodeGenerator::visit(DeclStmtNode& node) {
-    sym_table.addSymbol(node.id, current_stack_off);
-
+    // 分配局部变量
+    sym_table.addSymbol(node.id, stack_offset);
+    stack_offset += 4;
+    // 处理初始化表达式
     if (node.initExpr) {
         const std::string result_reg = generateExpr(node.initExpr);
-        storeWord(result_reg, current_stack_off);
-        freeRegister(result_reg);
-    } else {
-        storeWord("x0", current_stack_off);
-    }
+        const CodeGenSymbol* sym = sym_table.lookupSymbol(node.id);
 
-    current_stack_off -= 4;
+        // 检查偏移量是否在立即数范围内
+        if (sym->offset >= -2048 && sym->offset < 2048) {
+            out << "    sw " << result_reg << ", " << sym->offset << "(sp)\n";
+        }
+        else {
+            // 偏移量太大，需要先计算地址
+            const std::string addr_reg = allocateRegister();
+            out << "    li " << addr_reg << ", " << sym->offset << "\n";
+            out << "    add " << addr_reg << ", sp, " << addr_reg << "\n";
+            out << "    sw " << result_reg << ", 0(" << addr_reg << ")\n";
+            freeRegister(addr_reg);
+        }
+
+        freeRegister(result_reg);
+    }
+    // 没有初始化表达式，变量默认为0
+    else {
+        const CodeGenSymbol* sym = sym_table.lookupSymbol(node.id);
+
+        // 检查偏移量是否在立即数范围内
+        if (sym->offset >= -2048 && sym->offset < 2048) {
+            out << "    sw x0, " << sym->offset << "(sp)\n";
+        }
+        else {
+            // 偏移量太大，需要先计算地址
+            const std::string addr_reg = allocateRegister();
+            out << "    li " << addr_reg << ", " << sym->offset << "\n";
+            out << "    add " << addr_reg << ", sp, " << addr_reg << "\n";
+            out << "    sw x0, 0(" << addr_reg << ")\n";
+            freeRegister(addr_reg);
+        }
+    }
 }
 
 void CodeGenerator::visit(IfStmtNode& node) {
@@ -382,7 +528,6 @@ void CodeGenerator::visit(ReturnStmtNode& node) {
         }
         freeRegister(result_reg);
     }
-    // 跳转到当前函数的尾声标签
     out << "    j " << current_function << "_epilogue\n";
 }
 
@@ -550,12 +695,25 @@ void CodeGenerator::visit(PrimaryExprNode& node) {
     }
     else if (!node.value.empty() && (std::isalpha(node.value[0]) || node.value[0] == '_') &&
         std::all_of(node.value.begin(), node.value.end(), [](const char c) { return std::isalnum(c) || c == '_'; })) {
+        // 变量
         const CodeGenSymbol* sym = sym_table.lookupSymbol(node.value);
         if (!sym) {
             throw std::runtime_error("Undefined variable: " + node.value);
         }
         const std::string result_reg = allocateRegister();
-        loadWord(result_reg, sym->offset);
+
+        // 检查偏移量是否在立即数范围内
+        if (sym->offset >= -2048 && sym->offset < 2048) {
+            out << "    lw " << result_reg << ", " << sym->offset << "(sp)\n";
+        }
+        else {
+            // 偏移量太大，需要先计算地址
+            const std::string addr_reg = allocateRegister();
+            out << "    li " << addr_reg << ", " << sym->offset << "\n";
+            out << "    add " << addr_reg << ", sp, " << addr_reg << "\n";
+            out << "    lw " << result_reg << ", 0(" << addr_reg << ")\n";
+            freeRegister(addr_reg);
+        }
         current_expr_result = result_reg;
     }
     else {
@@ -568,65 +726,168 @@ void CodeGenerator::visit(ParamNode& node) {
 }
 
 void CodeGenerator::visit(FuncCallExprNode& node) {
-    // 1) 为“第9个及以后”的栈上传参预留空间
-    int stack_args = 0;
-    if (node.args.size() > 8) {
-        stack_args = static_cast<int>(node.args.size()) - 8;
-        int bytes = stack_args * 4;
-        if (bytes >= -2048 && bytes < 2048) {
-            out << "    addi sp, sp, -" << bytes << "\n";
-        } else {
-            out << "    li t0, " << bytes << "\n";
-            out << "    sub sp, sp, t0\n";
+    // 保存调用者保存的寄存器 (caller-saved registers)
+    std::vector<std::string> saved_regs;
+    std::vector<int> save_offsets;
+
+    // 保存所有当前使用的临时寄存器
+    for (int i = 0; i < RegisterAllocator::NUM_TEMP_REGS; ++i) {
+        std::string temp_reg = "t" + std::to_string(i);
+        if (reg_alloc.isUsed(temp_reg)) {
+            int offset = getTempStackOffset();
+
+            if (offset >= -2048 && offset < 2048) {
+                out << "    sw " << temp_reg << ", " << offset << "(sp)\n";
+            }
+            else {
+                // 使用临时寄存器来处理大偏移
+                out << "    addi sp, sp, -8\n";
+                out << "    sw t5, 0(sp)\n";
+                out << "    li t5, " << offset << "\n";
+                out << "    add t5, sp, t5\n";
+                out << "    addi t5, t5, 8\n";
+                out << "    sw " << temp_reg << ", 0(t5)\n";
+                out << "    lw t5, 0(sp)\n";
+                out << "    addi sp, sp, 8\n";
+            }
+
+            saved_regs.push_back(temp_reg);
+            save_offsets.push_back(offset);
         }
     }
 
-    // 2) 逐个实参：算一个 → 就位一个 → 立刻释放寄存器
-    for (size_t i = 0; i < node.args.size(); ++i) {
-        std::string r = generateExpr(node.args[i]);
+// 计算参数表达式
+    std::vector<std::string> arg_values;
+    std::vector<int> arg_stack_offsets;
 
-        if (i < 8) {
-            out << "    mv a" << i << ", " << r << "\n";
-        } else {
-            // 直接写入我们刚刚在当前 sp 之上的“入参区”
-            storeWord(r, static_cast<int>((i - 8) * 4), "sp");
+    // 先计算所有参数并保存到栈上，避免寄存器冲突
+    for (const auto & arg : node.args) {
+        std::string arg_reg = generateExpr(arg);
+        int offset = getTempStackOffset();
+
+        if (offset >= -2048 && offset < 2048) {
+            out << "    sw " << arg_reg << ", " << offset << "(sp)\n";
+        }
+        else {
+            out << "    addi sp, sp, -8\n";
+            out << "    sw t5, 0(sp)\n";
+            out << "    li t5, " << offset << "\n";
+            out << "    add t5, sp, t5\n";
+            out << "    addi t5, t5, 8\n";
+            out << "    sw " << arg_reg << ", 0(t5)\n";
+            out << "    lw t5, 0(sp)\n";
+            out << "    addi sp, sp, 8\n";
         }
 
-        freeRegister(r);  // 立刻释放，避免被后续计算覆盖
+        arg_stack_offsets.push_back(offset);
+        freeRegister(arg_reg);
     }
 
-    // 3) 发起调用
+    // 将参数从栈加载到正确的寄存器 (a0-a7)
+    for (size_t i = 0; i < std::min(node.args.size(), static_cast<size_t>(8)); ++i) {
+        std::string target_reg = "a" + std::to_string(i);
+        const int offset = arg_stack_offsets[i];
+
+        if (offset >= -2048 && offset < 2048) {
+            out << "    lw " << target_reg << ", " << offset << "(sp)\n";
+        }
+        else {
+            out << "    addi sp, sp, -8\n";
+            out << "    sw t5, 0(sp)\n";
+            out << "    li t5, " << offset << "\n";
+            out << "    add t5, sp, t5\n";
+            out << "    addi t5, t5, 8\n";
+            out << "    lw " << target_reg << ", 0(t5)\n";
+            out << "    lw t5, 0(sp)\n";
+            out << "    addi sp, sp, 8\n";
+        }
+    }
+
+    // 处理超过8个参数的情况（通过栈传递）
+    for (size_t i = 8; i < node.args.size(); ++i) {
+        out << "    addi sp, sp, -4\n";
+
+        const int offset = arg_stack_offsets[i];
+        std::string temp = "t0";  // 使用固定的临时寄存器
+
+        if (offset >= -2048 && offset < 2048) {
+            out << "    lw " << temp << ", " << offset + 4 << "(sp)\n";  // +4因为我们刚调整了sp
+        }
+        else {
+            out << "    addi sp, sp, -8\n";
+            out << "    sw t5, 0(sp)\n";
+            out << "    li t5, " << (offset + 12) << "\n";  // +12 = +4 (sp调整) + 8 (临时保存t5)
+            out << "    add t5, sp, t5\n";
+            out << "    lw " << temp << ", 0(t5)\n";
+            out << "    lw t5, 0(sp)\n";
+            out << "    addi sp, sp, 8\n";
+        }
+
+        out << "    sw " << temp << ", 0(sp)\n";
+    }
+
+    // 调用函数
     out << "    jal ra, " << node.funcName << "\n";
 
-    // 4) 回收“溢出参数”的栈空间
-    if (stack_args > 0) {
-        int bytes = stack_args * 4;
-        if (bytes >= -2048 && bytes < 2048) {
-            out << "    addi sp, sp, " << bytes << "\n";
-        } else {
-            out << "    li t0, " << bytes << "\n";
-            out << "    add sp, sp, t0\n";
+    // 恢复栈指针（如果有超过8个参数）
+    if (node.args.size() > 8) {
+        const int extra_args = static_cast<int>(node.args.size()) - 8;
+        out << "    addi sp, sp, " << (extra_args * 4) << "\n";
+    }
+
+    // 恢复保存的寄存器（逆序）
+    for (int i = static_cast<int>(saved_regs.size()) - 1; i >= 0; --i) {
+        const int offset = save_offsets[i];
+
+        if (offset >= -2048 && offset < 2048) {
+            out << "    lw " << saved_regs[i] << ", " << offset << "(sp)\n";
+        }
+        else {
+            out << "    addi sp, sp, -8\n";
+            out << "    sw t5, 0(sp)\n";
+            out << "    li t5, " << offset << "\n";
+            out << "    add t5, sp, t5\n";
+            out << "    addi t5, t5, 8\n";
+            out << "    lw " << saved_regs[i] << ", 0(t5)\n";
+            out << "    lw t5, 0(sp)\n";
+            out << "    addi sp, sp, 8\n";
         }
     }
 
-    // 5) a0 作为调用表达式结果，拷到一个临时寄存器里返回给上层
-    std::string res = allocateRegister();
-    out << "    mv " << res << ", a0\n";
-    current_expr_result = res;
-}
-
-void CodeGenerator::visit(CallStmtNode& node) {
-    // 直接复用函数调用表达式的生成逻辑
-    node.call->accept(*this);
-
-    // 这是“语句形式”的调用，返回值没人用，释放掉表达式里占用的寄存器即可
-    if (!current_expr_result.empty()) {
-        freeRegister(current_expr_result);
-        // 可选：清空标记，避免上层误用
-        current_expr_result.clear();
+    // 将返回值保存到栈上，避免被后续操作覆盖
+    const int return_offset = getTempStackOffset();
+    if (return_offset >= -2048 && return_offset < 2048) {
+        out << "    sw a0, " << return_offset << "(sp)\n";
     }
-}
+    else {
+        out << "    addi sp, sp, -8\n";
+        out << "    sw t5, 0(sp)\n";
+        out << "    li t5, " << return_offset << "\n";
+        out << "    add t5, sp, t5\n";
+        out << "    addi t5, t5, 8\n";
+        out << "    sw a0, 0(t5)\n";
+        out << "    lw t5, 0(sp)\n";
+        out << "    addi sp, sp, 8\n";
+    }
 
+    // 分配新寄存器来保存返回值
+    const std::string result_reg = allocateRegister();
+    if (return_offset >= -2048 && return_offset < 2048) {
+        out << "    lw " << result_reg << ", " << return_offset << "(sp)\n";
+    }
+    else {
+        out << "    addi sp, sp, -8\n";
+        out << "    sw t5, 0(sp)\n";
+        out << "    li t5, " << return_offset << "\n";
+        out << "    add t5, sp, t5\n";
+        out << "    addi t5, t5, 8\n";
+        out << "    lw " << result_reg << ", 0(t5)\n";
+        out << "    lw t5, 0(sp)\n";
+        out << "    addi sp, sp, 8\n";
+    }
+
+    current_expr_result = result_reg;
+}
 
 void CodeGenerator::generateCond(const std::shared_ptr<ExprNode>& expr, const std::string& falseLabel) {
     if (const auto andNode = std::dynamic_pointer_cast<LAndExprNode>(expr)) {
@@ -666,141 +927,145 @@ void CodeGenerator::generateCondOr(const std::shared_ptr<LOrExprNode>& node, con
     out << trueLabel << ":\n";
 }
 
+void CodeGenerator::visit(CallStmtNode& node) {
+    node.call->accept(*this);
+    // void函数调用语句，无需处理返回值
+    if (current_expr_result != "a0") {
+        freeRegister(current_expr_result);
+    }
+}
 // 计算临时空间需求
-int CodeGenerator::calculateTempSpaceNeed(const std::shared_ptr<BlockNode>& block) {
-    int temp_space = 256;
-    int max_function_call_args = 0;
-    int max_expression_depth = 0;
-    int max_arg_prep_space = 0;
-    int max_nested_calls = 0;  // 新增：嵌套调用深度
-
-    std::function<void(const std::shared_ptr<BlockNode>&)> analyzeBlock;
-    std::function<int(const std::shared_ptr<ExprNode>&, int)> analyzeExpr;
-
-    analyzeExpr = [&](const std::shared_ptr<ExprNode>& expr, int call_depth) -> int {
+int CodeGenerator::calculateTempSpaceNeed(const
+std::shared_ptr<BlockNode>& block) {
+    int temp_space = 256; // 基础临时空间
+    int max_function_call_args = 0; // 最大函数调用参数数量
+    int max_expression_depth = 0; // 最大表达式深度
+    std::function<void(const std::shared_ptr<BlockNode>&)>
+    analyzeBlock;
+    std::function<int(const std::shared_ptr<ExprNode>&)>
+    analyzeExpr;
+    analyzeExpr = [&](const std::shared_ptr<ExprNode>& expr) ->
+    int {
         if (!expr) return 0;
-
-        if (const auto funcCall = std::dynamic_pointer_cast<FuncCallExprNode>(expr)) {
-            max_function_call_args = std::max(max_function_call_args, static_cast<int>(funcCall->args.size()));
-            max_nested_calls = std::max(max_nested_calls, call_depth + 1);
-
-            int arg_prep_count = 0;
-            for (const auto& arg : funcCall->args) {
-                if (std::dynamic_pointer_cast<AddExprNode>(arg) ||
-                    std::dynamic_pointer_cast<MulExprNode>(arg) ||
-                    std::dynamic_pointer_cast<FuncCallExprNode>(arg)) {
-                    arg_prep_count++;
-                }
-            }
-            max_arg_prep_space = std::max(max_arg_prep_space, arg_prep_count * 4);
-
+        if (const auto funcCall =
+        std::dynamic_pointer_cast<FuncCallExprNode>(expr)) {
+            max_function_call_args =
+            std::max(max_function_call_args, static_cast<int>(funcCall->args.size()));
             int depth = 1;
             for (const auto& arg : funcCall->args) {
-                depth = std::max(depth, 1 + analyzeExpr(arg, call_depth + 1));
+                depth = std::max(depth, 1 + analyzeExpr(arg));
             }
             return depth;
         }
-        else if (const auto add = std::dynamic_pointer_cast<AddExprNode>(expr)) {
-            return 1 + std::max(analyzeExpr(add->left, call_depth), analyzeExpr(add->right, call_depth));
+        else if (const auto binaryExpr =
+        std::dynamic_pointer_cast<AddExprNode>(expr)) {
+            return 1 + std::max(analyzeExpr(binaryExpr->left),
+            analyzeExpr(binaryExpr->right));
         }
-        else if (const auto mul = std::dynamic_pointer_cast<MulExprNode>(expr)) {
-            return 1 + std::max(analyzeExpr(mul->left, call_depth), analyzeExpr(mul->right, call_depth));
+        else if (const auto binaryExpr =
+        std::dynamic_pointer_cast<MulExprNode>(expr)) {
+            return 1 + std::max(analyzeExpr(binaryExpr->left),analyzeExpr(binaryExpr->right));
         }
-        else if (const auto rel = std::dynamic_pointer_cast<RelExprNode>(expr)) {
-            return 1 + std::max(analyzeExpr(rel->left, call_depth), analyzeExpr(rel->right, call_depth));
+        else if (const auto binaryExpr =
+        std::dynamic_pointer_cast<RelExprNode>(expr)) {
+            return 1 + std::max(analyzeExpr(binaryExpr->left),
+            analyzeExpr(binaryExpr->right));
         }
-        else if (const auto lor = std::dynamic_pointer_cast<LOrExprNode>(expr)) {
-            return 1 + std::max(analyzeExpr(lor->left, call_depth), analyzeExpr(lor->right, call_depth));
+        else if (const auto binaryExpr =
+        std::dynamic_pointer_cast<LAndExprNode>(expr)) {
+            return 1 + std::max(analyzeExpr(binaryExpr->left),
+            analyzeExpr(binaryExpr->right));
         }
-        else if (const auto land = std::dynamic_pointer_cast<LAndExprNode>(expr)) {
-            return 1 + std::max(analyzeExpr(land->left, call_depth), analyzeExpr(land->right, call_depth));
+        else if (const auto binaryExpr =
+        std::dynamic_pointer_cast<LOrExprNode>(expr)) {
+            return 1 + std::max(analyzeExpr(binaryExpr->left),
+            analyzeExpr(binaryExpr->right));
         }
-        else if (const auto unary = std::dynamic_pointer_cast<UnaryExprNode>(expr)) {
-            return 1 + analyzeExpr(unary->expr, call_depth);
+        else if (const auto unaryExpr =
+        std::dynamic_pointer_cast<UnaryExprNode>(expr)) {
+            return 1 + analyzeExpr(unaryExpr->expr);
         }
-        return 1;
+        return 1; // 基本表达式
     };
-
-    analyzeBlock = [&](const std::shared_ptr<BlockNode>& blk) {
-        for (const auto& stmt : blk->stmts) {
-            if (const auto exprStmt = std::dynamic_pointer_cast<ExprStmtNode>(stmt)) {
-                max_expression_depth = std::max(max_expression_depth, analyzeExpr(exprStmt->expr, 0));
+    analyzeBlock = [&](const std::shared_ptr<BlockNode>&
+    current_block) {
+        for (const auto& stmt : current_block->stmts) {
+            if (const auto exprStmt =
+            std::dynamic_pointer_cast<ExprStmtNode>(stmt)) {
+                max_expression_depth =
+                std::max(max_expression_depth, analyzeExpr(exprStmt->expr));
             }
-            else if (const auto assignStmt = std::dynamic_pointer_cast<AssignStmtNode>(stmt)) {
-                max_expression_depth = std::max(max_expression_depth, analyzeExpr(assignStmt->expr, 0));
+            else if (const auto assignStmt =
+            std::dynamic_pointer_cast<AssignStmtNode>(stmt)) {
+                max_expression_depth =std::max(max_expression_depth, analyzeExpr(assignStmt->expr));
             }
-            else if (const auto declStmt = std::dynamic_pointer_cast<DeclStmtNode>(stmt)) {
+            else if (const auto declStmt =
+            std::dynamic_pointer_cast<DeclStmtNode>(stmt)) {
                 if (declStmt->initExpr) {
-                    max_expression_depth = std::max(max_expression_depth, analyzeExpr(declStmt->initExpr, 0));
+                    max_expression_depth =
+                    std::max(max_expression_depth, analyzeExpr(declStmt->initExpr));
                 }
             }
-            else if (const auto ifStmt = std::dynamic_pointer_cast<IfStmtNode>(stmt)) {
-                max_expression_depth = std::max(max_expression_depth, analyzeExpr(ifStmt->cond, 0));
-                if (auto thenBlock = std::dynamic_pointer_cast<BlockNode>(ifStmt->thenStmt))
+            else if (const auto ifStmt =
+            std::dynamic_pointer_cast<IfStmtNode>(stmt)) {
+                max_expression_depth =
+                std::max(max_expression_depth, analyzeExpr(ifStmt->cond));
+                if (auto thenBlock =
+                std::dynamic_pointer_cast<BlockNode>(ifStmt->thenStmt)) {
                     analyzeBlock(thenBlock);
+                }
                 if (ifStmt->elseStmt) {
-                    if (auto elseBlock = std::dynamic_pointer_cast<BlockNode>(ifStmt->elseStmt))
+                    if (auto elseBlock =
+                    std::dynamic_pointer_cast<BlockNode>(ifStmt->elseStmt)) {
                         analyzeBlock(elseBlock);
-                }
-            }
-            else if (const auto whileStmt = std::dynamic_pointer_cast<WhileStmtNode>(stmt)) {
-                max_expression_depth = std::max(max_expression_depth, analyzeExpr(whileStmt->cond, 0));
-                if (auto bodyBlock = std::dynamic_pointer_cast<BlockNode>(whileStmt->body))
-                    analyzeBlock(bodyBlock);
-            }
-            else if (const auto returnStmt = std::dynamic_pointer_cast<ReturnStmtNode>(stmt)) {
-                if (returnStmt->retExpr) {
-                    max_expression_depth = std::max(max_expression_depth, analyzeExpr(returnStmt->retExpr, 0));
-                }
-            }
-            else if (const auto callStmt = std::dynamic_pointer_cast<CallStmtNode>(stmt)) {
-                if (const auto funcCall = std::dynamic_pointer_cast<FuncCallExprNode>(callStmt->call)) {
-                    max_function_call_args = std::max(max_function_call_args, static_cast<int>(funcCall->args.size()));
-                    int arg_prep_count = 0;
-                    for (const auto& arg : funcCall->args) {
-                        if (std::dynamic_pointer_cast<AddExprNode>(arg) ||
-                            std::dynamic_pointer_cast<MulExprNode>(arg) ||
-                            std::dynamic_pointer_cast<FuncCallExprNode>(arg)) {
-                            arg_prep_count++;
-                        }
-                        max_expression_depth = std::max(max_expression_depth, analyzeExpr(arg, 0));
                     }
-                    max_arg_prep_space = std::max(max_arg_prep_space, arg_prep_count * 4);
                 }
             }
-            else if (auto subBlk = std::dynamic_pointer_cast<BlockNode>(stmt)) {
-                analyzeBlock(subBlk);
+            else if (const auto whileStmt =
+            std::dynamic_pointer_cast<WhileStmtNode>(stmt)) {
+                max_expression_depth =
+                std::max(max_expression_depth, analyzeExpr(whileStmt->cond));
+                if (auto bodyBlock =
+                std::dynamic_pointer_cast<BlockNode>(whileStmt->body)) {
+                    analyzeBlock(bodyBlock);
+                }
+            }
+            else if (const auto returnStmt =
+            std::dynamic_pointer_cast<ReturnStmtNode>(stmt)){if (returnStmt->retExpr) {
+                max_expression_depth =
+                std::max(max_expression_depth, analyzeExpr(returnStmt->retExpr));
+            }
+            }
+            else if (const auto callStmt =
+            std::dynamic_pointer_cast<CallStmtNode>(stmt)) {
+                if (const auto funcCall =
+                std::dynamic_pointer_cast<FuncCallExprNode>(callStmt->call)) {
+                    max_function_call_args =
+                    std::max(max_function_call_args, static_cast<int>(funcCall->args.size()));
+                    for (const auto& arg : funcCall->args) {
+                        max_expression_depth =
+                        std::max(max_expression_depth, analyzeExpr(arg));
+                    }
+                }
+            }
+            else if (auto blockStmt =
+            std::dynamic_pointer_cast<BlockNode>(stmt)) {
+                analyzeBlock(blockStmt);
             }
         }
     };
-
     analyzeBlock(block);
-
-    // 基础空间计算
-    int function_call_space = max_function_call_args * 8;  // 增加每个参数的空间
-    int expression_space = max_expression_depth * 16;      // 增加表达式栈空间
-    int nested_call_space = max_nested_calls * 64;         // 嵌套调用额外空间
-
-    temp_space = std::max(temp_space, function_call_space + expression_space + max_arg_prep_space + nested_call_space);
-
-    // 增加基础缓冲区
-    temp_space += 1024;  // 从512增加到1024
-
-    // 大参数函数额外空间
-    if (max_function_call_args > 8) {
-        temp_space += (max_function_call_args - 8) * 16;  // 增加栈参数空间
-    }
-
-    // 寄存器保存区
-    temp_space += RegisterAllocator::NUM_TEMP_REGS * 4 + 64;  // 增加安全边界
-
-    // 确保最小空间
-    temp_space = std::max(temp_space, 2048);  // 最小2KB
-
-    // 对齐到16B
-    if (temp_space % 16 != 0) {
-        temp_space = ((temp_space / 16) + 1) * 16;
-    }
-
+    // 根据分析结果计算临时空间需求
+    // 函数调用参数保存空间：每个参数4字节 + 寄存器溢出保存
+    int function_call_space = max_function_call_args * 4 + 7 *
+    4; // 7个临时寄存器溢出
+    // 表达式计算临时空间：每层嵌套需要额外的临时存储
+    int expression_space = max_expression_depth * 8; // 每层8字节
+    // 总临时空间 = 基础空间 + 函数调用空间 + 表达式空间
+    temp_space = std::max(temp_space, function_call_space +
+    expression_space);
+    // 为main函数提供额外空间（通常包含更多复杂操作）
+    temp_space += 200; // 额外缓冲区
     return temp_space;
 }
+

@@ -13,104 +13,104 @@
 #include "Parser.h"
 #include "ASTVisitor.h"
 
-#include <list>
-#include <unordered_map>
-#include <unordered_set>
-
-// 寄存器分配器 - 使用 t0-t6 作为临时寄存器，使用LRU spill策略
+// 寄存器分配器 - 使用 t0-t6 作为临时寄存器
 class RegisterAllocator {
 public:
     static constexpr int NUM_TEMP_REGS = 7; // t0~t6
 
-    RegisterAllocator() {
-        reset();
+    RegisterAllocator() : next_reg(0) {
+        for (bool & i : reg_in_use) {
+            i = false;
+        }
     }
 
     // 尝试分配寄存器，如果失败返回空字符串
     std::string tryAllocate() {
-        if (!free_regs.empty()) {
-            auto it = free_regs.begin();
-            std::string reg = *it;
-            free_regs.erase(it);
-            lru_used.push_back(reg);
-            reg_to_iter[reg] = --lru_used.end();
-            return reg;
+        // 循环查找空闲寄存器
+        for (int i = 0; i < NUM_TEMP_REGS; ++i) {
+            if (!reg_in_use[i]) {
+                reg_in_use[i] = true;
+                return "t" + std::to_string(i);
+            }
         }
         return ""; // 没有可用寄存器
     }
 
-    // 强制标记寄存器为已使用
-    void markUsed(const std::string& reg) {
-        if (free_regs.count(reg)) {
-            free_regs.erase(reg);
-            lru_used.push_back(reg);
-            reg_to_iter[reg] = --lru_used.end();
-        } else if (reg_to_iter.count(reg)) {
-            // 已使用，移动到最近
-            lru_used.splice(lru_used.end(), lru_used, reg_to_iter[reg]);
-            reg_to_iter[reg] = --lru_used.end();
-        }
-    }
-
-    // 强制分配寄存器，如果需要会选择一个寄存器溢出（LRU策略）
+    // 强制分配寄存器，如果需要会选择一个寄存器溢出
     std::pair<std::string, int> forceAllocate(std::ostream& out, const int temp_offset) {
         std::string reg = tryAllocate();
         if (!reg.empty()) {
             return { reg, -1 }; // 不需要溢出
         }
 
-        if (lru_used.empty()) {
-            throw std::runtime_error("No registers to spill");
+        // 选择 t6 作为溢出寄存器（或使用LRU策略）
+        reg = "t6";
+        int spill_offset = temp_offset;
+
+        // 检查偏移量是否在立即数范围内
+        if (spill_offset >= -2048 && spill_offset < 2048) {
+            out << "    sw " << reg << ", " << spill_offset << "(sp)  # spill\n";
+        }
+        else {
+            // 需要使用临时寄存器来计算地址
+            // 使用 addi sp, sp, -8 来临时保存 t5
+            out << "    addi sp, sp, -8\n";
+            out << "    sw t5, 0(sp)  # save t5\n";
+            out << "    li t5, " << spill_offset << "\n";
+            out << "    add t5, sp, t5\n";
+            out << "    addi t5, t5, 8\n";  // 补偿临时调整的sp
+            out << "    sw " << reg << ", 0(t5)  # spill\n";
+            out << "    lw t5, 0(sp)  # restore t5\n";
+            out << "    addi sp, sp, 8\n";
         }
 
-        // 选择LRU (front)
-        reg = lru_used.front();
-        lru_used.pop_front();
-        reg_to_iter.erase(reg);
-
-        // Spill
-        if (temp_offset >= -2048 && temp_offset < 2048) {
-            out << "    sw " << reg << ", " << temp_offset << "(fp)  # spill\n";
-        } else {
-            out << "    li a7, " << temp_offset << "\n";
-            out << "    add a7, fp, a7\n";
-            out << "    sw " << reg << ", 0(a7)  # spill\n";
-        }
-
-        // 放回作为最近使用
-        lru_used.push_back(reg);
-        reg_to_iter[reg] = --lru_used.end();
-
-        return { reg, temp_offset };
+        return { reg, spill_offset };
     }
 
     void free(const std::string& reg) {
-        auto it = reg_to_iter.find(reg);
-        if (it != reg_to_iter.end()) {
-            lru_used.erase(it->second);
-            reg_to_iter.erase(it);
+        // 提取寄存器编号，处理t10及以上的情况
+        if (reg.length() >= 2 && reg[0] == 't') {
+            try {
+                const int reg_num = std::stoi(reg.substr(1));
+                if (reg_num >= 0 && reg_num < NUM_TEMP_REGS) {
+                    reg_in_use[reg_num] = false;
+                }
+            }
+            catch (...) {}
         }
-        free_regs.insert(reg);
     }
 
     [[nodiscard]] bool isUsed(const std::string& reg) const {
-        return !free_regs.count(reg);
+        if (reg.length() >= 2 && reg[0] == 't') {
+            try {
+                const int reg_num = std::stoi(reg.substr(1));
+                if (reg_num >= 0 && reg_num < NUM_TEMP_REGS) {
+                    return reg_in_use[reg_num];
+                }
+            }
+            catch (...) {}
+        }
+        return false;
     }
 
     void reset() {
-        free_regs = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
-        lru_used.clear();
-        reg_to_iter.clear();
+        next_reg = 0;
+        for (bool & i : reg_in_use) {
+            i = false;
+        }
     }
 
     [[nodiscard]] int getUsedCount() const {
-        return NUM_TEMP_REGS - free_regs.size();
+        int count = 0;
+        for (const bool i : reg_in_use) {
+            if (i) count++;
+        }
+        return count;
     }
 
 private:
-    std::unordered_set<std::string> free_regs;
-    std::list<std::string> lru_used;
-    std::unordered_map<std::string, std::list<std::string>::iterator> reg_to_iter;
+    int next_reg;
+    bool reg_in_use[NUM_TEMP_REGS]{};
 };
 
 // 符号表条目（代码生成用）
@@ -174,17 +174,13 @@ class CodeGenerator final : public ASTVisitor {
 public:
     explicit CodeGenerator(std::ostream& output)
         : out(output), label_counter(0), stack_offset(0), temp_offset(0),
-          in_continue_statement(false) {
+        in_continue_statement(false) {
     }
 
     void generate(const std::shared_ptr<CompUnitNode>& root);
 
-    void storeWord(const std::string& src_reg, int offset, const std::string& base_reg = "fp");
-    void loadWord(const std::string& dest_reg, int offset, const std::string& base_reg = "fp");
-
     // ASTVisitor接口实现
     void visit(CompUnitNode& node) override;
-    //int computeMaxCallArgs(const std::shared_ptr<BlockNode>& block) const;
     void visit(FuncDefNode& node) override;
     void visit(BlockNode& node) override;
     void visit(StmtNode& node) override;
@@ -234,8 +230,7 @@ private:
     std::vector<std::string> continue_labels;   // 用于continue语句的标签
     std::string current_expr_result;             // 当前表达式的结果寄存器
     bool in_continue_statement;                 // 是否在continue语句中
-    //int current_out_arg_base = 0;  // 当前函数的出参区基址（相对sp的偏移）
-    int current_stack_off = 0;  // 当前栈偏移（负值，用于局部变量）
+
     // 溢出栈，记录需要恢复的寄存器和偏移
     std::stack<std::pair<std::string, int>> spill_stack;
 
@@ -254,17 +249,15 @@ private:
     // 获取一个临时栈位置
 
     int getTempStackOffset() {
-        int offset = temp_area_start - temp_offset;  // - temp_offset，向下分配
-
-        // 检查是否超出临时区（向下：offset < temp_area_end）
-        if (offset - 4 < temp_area_end) {  // 下一个分配会超出
-            temp_offset = 0;
-            offset = temp_area_start;
-        }
-
-        int result = offset;
+        const int offset = temp_offset;
         temp_offset += 4;
-        return result;
+        // 检查栈偏移量是否超出栈帧范围
+        if (temp_offset >= temp_area_end) { // 检查是否超出栈帧边界
+            throw std::runtime_error("Temporary stack area overflow:offset=" + std::to_string(temp_offset) +
+            ", limit=" +
+            std::to_string(temp_area_end));
+        }
+        return offset;
     }
 
     // 分配寄存器或溢出
