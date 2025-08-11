@@ -30,98 +30,28 @@ void CodeGenerator::visit(CompUnitNode& node) {
     }
 }
 
-// 新增：计算函数体中最大调用实参个数
-int CodeGenerator::computeMaxCallArgs(const std::shared_ptr<BlockNode>& block) const {
-    int max_args = 0;
-
-    std::function<void(const std::shared_ptr<ExprNode>&)> walkExpr =
-        [&](const std::shared_ptr<ExprNode>& expr) {
-        if (!expr) return;
-
-        if (const auto func_call = std::dynamic_pointer_cast<FuncCallExprNode>(expr)) {
-            max_args = std::max(max_args, (int)func_call->args.size());
-            // 递归处理参数中的函数调用
-            for (const auto& arg : func_call->args) {
-                walkExpr(arg);
-            }
-        }
-        else if (const auto add = std::dynamic_pointer_cast<AddExprNode>(expr)) {
-            walkExpr(add->left);
-            walkExpr(add->right);
-        }
-        else if (const auto mul = std::dynamic_pointer_cast<MulExprNode>(expr)) {
-            walkExpr(mul->left);
-            walkExpr(mul->right);
-        }
-        else if (const auto rel = std::dynamic_pointer_cast<RelExprNode>(expr)) {
-            walkExpr(rel->left);
-            walkExpr(rel->right);
-        }
-        else if (const auto land = std::dynamic_pointer_cast<LAndExprNode>(expr)) {
-            walkExpr(land->left);
-            walkExpr(land->right);
-        }
-        else if (const auto lor = std::dynamic_pointer_cast<LOrExprNode>(expr)) {
-            walkExpr(lor->left);
-            walkExpr(lor->right);
-        }
-        else if (const auto unary = std::dynamic_pointer_cast<UnaryExprNode>(expr)) {
-            walkExpr(unary->expr);
-        }
-    };
-
-    std::function<void(const std::shared_ptr<StmtNode>&)> walk =
-        [&](const std::shared_ptr<StmtNode>& stmt) {
-        if (!stmt) return;
-
-        if (const auto call_stmt = std::dynamic_pointer_cast<CallStmtNode>(stmt)) {
-            if (const auto func_call = std::dynamic_pointer_cast<FuncCallExprNode>(call_stmt->call)) {
-                max_args = std::max(max_args, (int)func_call->args.size());
-                for (const auto& arg : func_call->args) {
-                    walkExpr(arg);
-                }
-            }
-        }
-        else if (const auto expr_stmt = std::dynamic_pointer_cast<ExprStmtNode>(stmt)) {
-            walkExpr(expr_stmt->expr);
-        }
-        else if (const auto assign_stmt = std::dynamic_pointer_cast<AssignStmtNode>(stmt)) {
-            walkExpr(assign_stmt->expr);
-        }
-        else if (const auto decl_stmt = std::dynamic_pointer_cast<DeclStmtNode>(stmt)) {
-            if (decl_stmt->initExpr) {
-                walkExpr(decl_stmt->initExpr);
-            }
-        }
-        else if (const auto return_stmt = std::dynamic_pointer_cast<ReturnStmtNode>(stmt)) {
-            if (return_stmt->retExpr) {
-                walkExpr(return_stmt->retExpr);
-            }
-        }
-        else if (const auto block_stmt = std::dynamic_pointer_cast<BlockNode>(stmt)) {
-            for (const auto& s : block_stmt->stmts) walk(s);
-        }
-        else if (const auto if_stmt = std::dynamic_pointer_cast<IfStmtNode>(stmt)) {
-            walkExpr(if_stmt->cond);
-            walk(if_stmt->thenStmt);
-            walk(if_stmt->elseStmt);
-        }
-        else if (const auto while_stmt = std::dynamic_pointer_cast<WhileStmtNode>(stmt)) {
-            walkExpr(while_stmt->cond);
-            walk(while_stmt->body);
-        }
-    };
-
-    for (const auto& stmt : block->stmts) {
-        walk(stmt);
+void CodeGenerator::storeWord(const std::string& src_reg, int offset, const std::string& base_reg) {
+    if (offset >= -2048 && offset < 2048) {
+        out << "    sw " << src_reg << ", " << offset << "(" << base_reg << ")\n";
+    } else {
+        out << "    li a7, " << offset << "\n";
+        out << "    add a7, " << base_reg << ", a7\n";
+        out << "    sw " << src_reg << ", 0(a7)\n";
     }
-    return max_args;
 }
+
+void CodeGenerator::loadWord(const std::string& dest_reg, int offset, const std::string& base_reg) {
+    if (offset >= -2048 && offset < 2048) {
+        out << "    lw " << dest_reg << ", " << offset << "(" << base_reg << ")\n";
+    } else {
+        out << "    li a7, " << offset << "\n";
+        out << "    add a7, " << base_reg << ", a7\n";
+        out << "    lw " << dest_reg << ", 0(a7)\n";
+    }
+}
+
 void CodeGenerator::visit(FuncDefNode& node) {
     current_function = node.id;
-    stack_offset = 0;
-    temp_offset = 0;
-
     reg_alloc.reset();
     while (!spill_stack.empty()) {
         spill_stack.pop();
@@ -130,96 +60,53 @@ void CodeGenerator::visit(FuncDefNode& node) {
     out << node.id << ":\n";
     sym_table.enterScope();
 
-    // 1. 计算最大调用实参个数（用于预留出参区）
-    const int max_call_args = computeMaxCallArgs(node.block);
-
-    // 2. 计算各区域空间
+    // 计算空间（不预分配outgoing_space）
     const int frame_space = 8;  // ra(4B) + fp(4B)
     const int param_space = static_cast<int>(node.params.size()) * 4;
     const int local_space = calculateLocalSpace(node.block);
     int temp_space = calculateTempSpaceNeed(node.block);
 
-    // 预留调用出参区（超过8个的参数用）
-    const int outgoing_space = std::max(0, (max_call_args - 8)) * 4;
-
-    // 3. 计算总帧大小并对齐
-    int frame_size = param_space + local_space + temp_space + outgoing_space + frame_space;
+    // 总帧大小
+    int frame_size = param_space + local_space + temp_space + frame_space;
     alignStack(frame_size);
     current_function_stack_size = frame_size;
 
-    // 4. 生成序言（仅此处调整sp，函数体内不再修改）
+    // 生成序言
     emitPrologue(frame_size);
 
-    // 5. 处理形参（全部存入当前栈帧，符号表记录本地偏移）
-    int current_off = 0;
+    // 处理形参 - 使用fp负偏移
     for (size_t i = 0; i < node.params.size(); ++i) {
         const std::string& param_id = node.params[i]->id;
-        const int local_off = current_off;
-
+        const int local_off = -static_cast<int>((i + 1) * 4);  // 负偏移
         if (i < 8) {
-            // 前8个参数从寄存器存入栈帧
-            if (local_off >= -2048 && local_off < 2048) {
-                out << "    sw a" << i << ", " << local_off << "(sp)\n";
-            } else {
-                std::string addr_reg = allocateRegister();
-                out << "    li " << addr_reg << ", " << local_off << "\n";
-                out << "    add " << addr_reg << ", sp, " << addr_reg << "\n";
-                out << "    sw a" << i << ", 0(" << addr_reg << ")\n";
-                freeRegister(addr_reg);
-            }
+            storeWord("a" + std::to_string(i), local_off);
         } else {
-            // 超过8个的参数从调用者栈帧读取后存入当前栈帧
-            const int incoming_off = frame_size + (i - 8) * 4;  // 调用者传入的栈参数偏移
+            const int incoming_off = (i - 8) * 4;
             std::string temp_reg = allocateRegister();
-
-            if (incoming_off >= -2048 && incoming_off < 2048) {
-                out << "    lw " << temp_reg << ", " << incoming_off << "(sp)\n";
-            } else {
-                std::string addr_reg = allocateRegister();
-                out << "    li " << addr_reg << ", " << incoming_off << "\n";
-                out << "    add " << addr_reg << ", sp, " << addr_reg << "\n";
-                out << "    lw " << temp_reg << ", 0(" << addr_reg << ")\n";
-                freeRegister(addr_reg);
-            }
-
-            if (local_off >= -2048 && local_off < 2048) {
-                out << "    sw " << temp_reg << ", " << local_off << "(sp)\n";
-            } else {
-                std::string addr_reg = allocateRegister();
-                out << "    li " << addr_reg << ", " << local_off << "\n";
-                out << "    add " << addr_reg << ", sp, " << addr_reg << "\n";
-                out << "    sw " << temp_reg << ", 0(" << addr_reg << ")\n";
-                freeRegister(addr_reg);
-            }
+            loadWord(temp_reg, incoming_off);  // incoming_off 正，相对fp
+            storeWord(temp_reg, local_off);
             freeRegister(temp_reg);
         }
 
         sym_table.addSymbol(param_id, local_off, true, static_cast<int>(i));
-        current_off += 4;
     }
 
-    // 形参结束后：
-    stack_offset = param_space;
-    temp_area_start = stack_offset + local_space;
-    temp_area_end   = temp_area_start + temp_space;
+    // 设置局部变量起始偏移
+    current_stack_off = -param_space - 4;  // 负偏移，跳过参数
 
-    // 出参区基址（栈顶方向）
-    current_out_arg_base = frame_size;
+    // 临时区（使用fp负偏移）
+    temp_area_start = -param_space - local_space;
+    temp_area_end = temp_area_start - temp_space;
 
-    /*// 保护：避免临时区和出参区、保存区重叠
-    if (temp_area_end > frame_size - outgoing_space - frame_space) {
-        temp_area_end = frame_size - outgoing_space - frame_space;
-    }*/
-
-    // 7. 生成函数体
+    // 生成函数体
     node.block->accept(*this);
 
-    // 8. main函数默认返回0
+    // main默认返回0
     if (node.id == "main") {
         out << "    li a0, 0\n";
     }
 
-    // 9. 生成尾声标签和尾声
+    // 尾声
     out << current_function << "_epilogue:\n";
     emitEpilogue(frame_size);
 
@@ -339,17 +226,14 @@ void CodeGenerator::emitEpilogue(const int frame_size) const {
 }
 
 std::string CodeGenerator::allocateRegister() {
-    // 首先尝试正常分配
     std::string reg = reg_alloc.tryAllocate();
     if (!reg.empty()) {
         return reg;
     }
 
-    // 如果没有空闲寄存器，强制分配
     auto [forced_reg, spill_offset] = reg_alloc.forceAllocate(out, getTempStackOffset());
-    if (spill_offset >= 0) {
-        // 记录溢出信息
-        spill_stack.emplace( forced_reg, spill_offset );
+    if (spill_offset != -1) {  // 改为 != -1，因为-1表示无溢出
+        spill_stack.emplace(forced_reg, spill_offset);
     }
     return forced_reg;
 }
@@ -357,27 +241,11 @@ std::string CodeGenerator::allocateRegister() {
 void CodeGenerator::freeRegister(const std::string& reg) {
     reg_alloc.free(reg);
 
-    // 检查是否需要恢复溢出的值
     if (!spill_stack.empty() && spill_stack.top().first == reg) {
         auto [spilled_reg, offset] = spill_stack.top();
         spill_stack.pop();
-
-        // 检查偏移量是否在立即数范围内
-        if (offset >= -2048 && offset < 2048) {
-            out << "    lw " << spilled_reg << ", " << offset << "(sp)  # restore\n";
-        }
-        else {
-            // 需要使用临时寄存器来计算地址
-            out << "    addi sp, sp, -8\n";
-            out << "    sw t5, 0(sp)  # save t5\n";
-            out << "    li t5, " << offset << "\n";
-            out << "    add t5, sp, t5\n";
-            out << "    addi t5, t5, 8\n";  // 补偿临时调整的sp
-            out << "    lw " << spilled_reg << ", 0(t5)  # restore\n";
-            out << "    lw t5, 0(sp)  # restore t5\n";
-            out << "    addi sp, sp, 8\n";
-        }
-        // 不要再次标记为使用，因为我们刚刚释放了它
+        loadWord(spilled_reg, offset);  // 统一用loadWord
+        out << "  # restore\n";  // 可选注释
     }
 }
 
@@ -417,64 +285,22 @@ void CodeGenerator::visit(AssignStmtNode& node) {
     if (!sym) {
         throw std::runtime_error("Undefined variable: " + node.id);
     }
-
-    // 检查偏移量是否在立即数范围内
-    if (sym->offset >= -2048 && sym->offset < 2048) {
-        out << "    sw " << result_reg << ", " << sym->offset << "(sp)\n";
-    }
-    else {
-        // 偏移量太大，需要先计算地址
-        const std::string addr_reg = allocateRegister();
-        out << "    li " << addr_reg << ", " << sym->offset << "\n";
-        out << "    add " << addr_reg << ", sp, " << addr_reg << "\n";
-        out << "    sw " << result_reg << ", 0(" << addr_reg << ")\n";
-        freeRegister(addr_reg);
-    }
-
+    storeWord(result_reg, sym->offset);
     freeRegister(result_reg);
 }
 
 void CodeGenerator::visit(DeclStmtNode& node) {
-    // 分配局部变量
-    sym_table.addSymbol(node.id, stack_offset);
-    stack_offset += 4;
-    // 处理初始化表达式
+    sym_table.addSymbol(node.id, current_stack_off);
+
     if (node.initExpr) {
         const std::string result_reg = generateExpr(node.initExpr);
-        const CodeGenSymbol* sym = sym_table.lookupSymbol(node.id);
-
-        // 检查偏移量是否在立即数范围内
-        if (sym->offset >= -2048 && sym->offset < 2048) {
-            out << "    sw " << result_reg << ", " << sym->offset << "(sp)\n";
-        }
-        else {
-            // 偏移量太大，需要先计算地址
-            const std::string addr_reg = allocateRegister();
-            out << "    li " << addr_reg << ", " << sym->offset << "\n";
-            out << "    add " << addr_reg << ", sp, " << addr_reg << "\n";
-            out << "    sw " << result_reg << ", 0(" << addr_reg << ")\n";
-            freeRegister(addr_reg);
-        }
-
+        storeWord(result_reg, current_stack_off);
         freeRegister(result_reg);
+    } else {
+        storeWord("x0", current_stack_off);
     }
-    // 没有初始化表达式，变量默认为0
-    else {
-        const CodeGenSymbol* sym = sym_table.lookupSymbol(node.id);
 
-        // 检查偏移量是否在立即数范围内
-        if (sym->offset >= -2048 && sym->offset < 2048) {
-            out << "    sw x0, " << sym->offset << "(sp)\n";
-        }
-        else {
-            // 偏移量太大，需要先计算地址
-            const std::string addr_reg = allocateRegister();
-            out << "    li " << addr_reg << ", " << sym->offset << "\n";
-            out << "    add " << addr_reg << ", sp, " << addr_reg << "\n";
-            out << "    sw x0, 0(" << addr_reg << ")\n";
-            freeRegister(addr_reg);
-        }
-    }
+    current_stack_off -= 4;
 }
 
 void CodeGenerator::visit(IfStmtNode& node) {
@@ -558,6 +384,7 @@ void CodeGenerator::visit(ReturnStmtNode& node) {
     // 跳转到当前函数的尾声标签
     out << "    j " << current_function << "_epilogue\n";
 }
+
 std::string CodeGenerator::generateExpr(const std::shared_ptr<ExprNode>& expr, const std::string&) {
     expr->accept(*this);
     return current_expr_result;
@@ -722,25 +549,12 @@ void CodeGenerator::visit(PrimaryExprNode& node) {
     }
     else if (!node.value.empty() && (std::isalpha(node.value[0]) || node.value[0] == '_') &&
         std::all_of(node.value.begin(), node.value.end(), [](const char c) { return std::isalnum(c) || c == '_'; })) {
-        // 变量
         const CodeGenSymbol* sym = sym_table.lookupSymbol(node.value);
         if (!sym) {
             throw std::runtime_error("Undefined variable: " + node.value);
         }
         const std::string result_reg = allocateRegister();
-
-        // 检查偏移量是否在立即数范围内
-        if (sym->offset >= -2048 && sym->offset < 2048) {
-            out << "    lw " << result_reg << ", " << sym->offset << "(sp)\n";
-        }
-        else {
-            // 偏移量太大，需要先计算地址
-            const std::string addr_reg = allocateRegister();
-            out << "    li " << addr_reg << ", " << sym->offset << "\n";
-            out << "    add " << addr_reg << ", sp, " << addr_reg << "\n";
-            out << "    lw " << result_reg << ", 0(" << addr_reg << ")\n";
-            freeRegister(addr_reg);
-        }
+        loadWord(result_reg, sym->offset);
         current_expr_result = result_reg;
     }
     else {
@@ -753,101 +567,44 @@ void CodeGenerator::visit(ParamNode& node) {
 }
 
 void CodeGenerator::visit(FuncCallExprNode& node) {
-    const int n = static_cast<int>(node.args.size());
-
-    // 1. 收集当前使用的临时寄存器
-    std::vector<std::string> saved_regs;
-    std::vector<int> save_offsets;
-
-    // 使用临时区保存寄存器
-    int save_base = temp_area_start + temp_offset;
-    int save_off = 0;
-
-    for (int i = 0; i < RegisterAllocator::NUM_TEMP_REGS; ++i) {
-        std::string treg = "t" + std::to_string(i);
-        if (reg_alloc.isUsed(treg)) {
-            saved_regs.push_back(treg);
-            save_offsets.push_back(save_base + save_off);
-            save_off += 4;
-        }
+    // 先为栈上传参预留空间
+    int stack_args = 0;
+    if (node.args.size() > 8) {
+        stack_args = static_cast<int>(node.args.size()) - 8;
+        int bytes = stack_args * 4;
+        if (bytes >= -2048 && bytes < 2048) out << "    addi sp, sp, -" << bytes << "\n";
+        else { out << "    li t0, " << bytes << "\n"; out << "    sub sp, sp, t0\n"; }
     }
 
-    // 更新temp_offset以避免覆盖
-    int saved_temp_offset = temp_offset;
-    temp_offset += save_off;
+    // 逐个实参：算完就就位（放 a0..a7 或 sp 上的槽），然后立刻 free
+    for (size_t i = 0; i < node.args.size(); ++i) {
+        std::string r = generateExpr(node.args[i]);
 
-    // 2. 保存寄存器
-    for (size_t i = 0; i < saved_regs.size(); ++i) {
-        int off = save_offsets[i];
-        if (off >= -2048 && off < 2048) {
-            out << "    sw " << saved_regs[i] << ", " << off << "(sp)  # save " << saved_regs[i] << "\n";
-        } else {
-            // 使用固定的辅助寄存器 a7 (或 s0) 来计算地址
-            out << "    li a7, " << off << "\n";
-            out << "    add a7, sp, a7\n";
-            out << "    sw " << saved_regs[i] << ", 0(a7)  # save " << saved_regs[i] << "\n";
-        }
-    }
-
-    // 3. 释放保存的寄存器，供参数计算使用
-    for (const auto& r : saved_regs) {
-        reg_alloc.free(r);
-    }
-
-    // 4. 计算所有参数
-    std::vector<std::string> arg_regs;
-    arg_regs.reserve(n);
-    for (int i = 0; i < n; ++i) {
-        arg_regs.push_back(generateExpr(node.args[i]));
-    }
-
-    // 5. 传递参数
-    for (int i = 0; i < n; ++i) {
         if (i < 8) {
-            if (arg_regs[i] != "a" + std::to_string(i)) {
-                out << "    mv a" << i << ", " << arg_regs[i] << "\n";
-            }
+            out << "    mv a" << i << ", " << r << "\n";
         } else {
-            int off = current_out_arg_base + (i - 8) * 4;
-            if (off >= -2048 && off < 2048) {
-                out << "    sw " << arg_regs[i] << ", " << off << "(sp)\n";
-            } else {
-                out << "    li a7, " << off << "\n";
-                out << "    add a7, sp, a7\n";
-                out << "    sw " << arg_regs[i] << ", 0(a7)\n";
-            }
+            storeWord(r, static_cast<int>((i - 8) * 4), "sp");  // 直接写到预留的栈槽
         }
+        freeRegister(r);  // 立刻释放，避免后续计算把它溢出/覆盖
     }
 
-    // 6. 释放参数寄存器
-    for (const auto& r : arg_regs) {
-        freeRegister(r);
-    }
-
-    // 7. 调用函数
+    // 发起调用
     out << "    jal ra, " << node.funcName << "\n";
 
-    // 8. 恢复保存的寄存器（反向顺序）
-    for (int i = static_cast<int>(saved_regs.size()) - 1; i >= 0; --i) {
-        int off = save_offsets[i];
-        if (off >= -2048 && off < 2048) {
-            out << "    lw " << saved_regs[i] << ", " << off << "(sp)  # restore " << saved_regs[i] << "\n";
-        } else {
-            out << "    li a7, " << off << "\n";
-            out << "    add a7, sp, a7\n";
-            out << "    lw " << saved_regs[i] << ", 0(a7)  # restore " << saved_regs[i] << "\n";
-        }
-        // 重新标记为已使用
-        reg_alloc.markUsed(saved_regs[i]);
+    // 回收外溢参数的栈
+    if (stack_args > 0) {
+        int bytes = stack_args * 4;
+        if (bytes >= -2048 && bytes < 2048) out << "    addi sp, sp, " << bytes << "\n";
+        else { out << "    li t0, " << bytes << "\n"; out << "    add sp, sp, t0\n"; }
     }
 
-    // 恢复temp_offset
-    temp_offset = saved_temp_offset;
-
-    // 9. 保存返回值
-    current_expr_result = allocateRegister();
-    out << "    mv " << current_expr_result << ", a0\n";
+    // 返回值放入一个临时寄存器作为表达式结果
+    std::string res = allocateRegister();
+    out << "    mv " << res << ", a0\n";
+    current_expr_result = res;
 }
+
+
 void CodeGenerator::visit(CallStmtNode& node) {
     node.call->accept(*this);
     // 释放调用表达式使用的寄存器（无返回值需要保留）
