@@ -20,13 +20,6 @@ void CodeGenerator::generate(const std::shared_ptr<CompUnitNode>& root) {
     out << ".text\n";
     out << ".global main\n\n";
 
-    // 🔧 加一个极简入口，兼容无CRT的运行环境，避免 main 尾声 jr ra 崩溃
-    out << ".globl _start\n";
-    out << "_start:\n";
-    out << "    call main\n";   // a0 = main 的返回值
-    out << "    li a7, 93\n";   // Linux RISC-V: exit syscall
-    out << "    ecall\n\n";
-
     // 生成各函数代码
     root->accept(*this);
 }
