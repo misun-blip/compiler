@@ -20,9 +20,17 @@ void CodeGenerator::generate(const std::shared_ptr<CompUnitNode>& root) {
     out << ".text\n";
     out << ".global main\n\n";
 
-    // 生成代码
+    // 🔧 加一个极简入口，兼容无CRT的运行环境，避免 main 尾声 jr ra 崩溃
+    out << ".globl _start\n";
+    out << "_start:\n";
+    out << "    call main\n";   // a0 = main 的返回值
+    out << "    li a7, 93\n";   // Linux RISC-V: exit syscall
+    out << "    ecall\n\n";
+
+    // 生成各函数代码
     root->accept(*this);
 }
+
 
 void CodeGenerator::visit(CompUnitNode& node) {
     for (const auto& func : node.funcDefs) {
@@ -567,49 +575,65 @@ void CodeGenerator::visit(ParamNode& node) {
 }
 
 void CodeGenerator::visit(FuncCallExprNode& node) {
-    // 先为栈上传参预留空间
+    // 1) 为“第9个及以后”的栈上传参预留空间
     int stack_args = 0;
     if (node.args.size() > 8) {
         stack_args = static_cast<int>(node.args.size()) - 8;
         int bytes = stack_args * 4;
-        if (bytes >= -2048 && bytes < 2048) out << "    addi sp, sp, -" << bytes << "\n";
-        else { out << "    li t0, " << bytes << "\n"; out << "    sub sp, sp, t0\n"; }
+        if (bytes >= -2048 && bytes < 2048) {
+            out << "    addi sp, sp, -" << bytes << "\n";
+        } else {
+            out << "    li t0, " << bytes << "\n";
+            out << "    sub sp, sp, t0\n";
+        }
     }
 
-    // 逐个实参：算完就就位（放 a0..a7 或 sp 上的槽），然后立刻 free
+    // 2) 逐个实参：算一个 → 就位一个 → 立刻释放寄存器
     for (size_t i = 0; i < node.args.size(); ++i) {
         std::string r = generateExpr(node.args[i]);
 
         if (i < 8) {
             out << "    mv a" << i << ", " << r << "\n";
         } else {
-            storeWord(r, static_cast<int>((i - 8) * 4), "sp");  // 直接写到预留的栈槽
+            // 直接写入我们刚刚在当前 sp 之上的“入参区”
+            storeWord(r, static_cast<int>((i - 8) * 4), "sp");
         }
-        freeRegister(r);  // 立刻释放，避免后续计算把它溢出/覆盖
+
+        freeRegister(r);  // 立刻释放，避免被后续计算覆盖
     }
 
-    // 发起调用
+    // 3) 发起调用
     out << "    jal ra, " << node.funcName << "\n";
 
-    // 回收外溢参数的栈
+    // 4) 回收“溢出参数”的栈空间
     if (stack_args > 0) {
         int bytes = stack_args * 4;
-        if (bytes >= -2048 && bytes < 2048) out << "    addi sp, sp, " << bytes << "\n";
-        else { out << "    li t0, " << bytes << "\n"; out << "    add sp, sp, t0\n"; }
+        if (bytes >= -2048 && bytes < 2048) {
+            out << "    addi sp, sp, " << bytes << "\n";
+        } else {
+            out << "    li t0, " << bytes << "\n";
+            out << "    add sp, sp, t0\n";
+        }
     }
 
-    // 返回值放入一个临时寄存器作为表达式结果
+    // 5) a0 作为调用表达式结果，拷到一个临时寄存器里返回给上层
     std::string res = allocateRegister();
     out << "    mv " << res << ", a0\n";
     current_expr_result = res;
 }
 
-
 void CodeGenerator::visit(CallStmtNode& node) {
+    // 直接复用函数调用表达式的生成逻辑
     node.call->accept(*this);
-    // 释放调用表达式使用的寄存器（无返回值需要保留）
-    freeRegister(current_expr_result);
+
+    // 这是“语句形式”的调用，返回值没人用，释放掉表达式里占用的寄存器即可
+    if (!current_expr_result.empty()) {
+        freeRegister(current_expr_result);
+        // 可选：清空标记，避免上层误用
+        current_expr_result.clear();
+    }
 }
+
 
 void CodeGenerator::generateCond(const std::shared_ptr<ExprNode>& expr, const std::string& falseLabel) {
     if (const auto andNode = std::dynamic_pointer_cast<LAndExprNode>(expr)) {
